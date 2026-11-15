@@ -44,6 +44,8 @@ REFERENCE = {
     # the MTP step (2026-11-14: the same sampled text; the draft head only proposes)
     "STRATA_Q36_SPEC_TOPK": "1", "STRATA_Q36_COMMIT_GRAPH": "1", "STRATA_Q36_MTP_GRAPH": "1",
     "STRATA_Q36_DRAFT_VOCAB": "131072",
+    # the CPU experts' handoff and row prefetch, the MTP block's prompt pass as K/V only (2026-11-15: the same text)
+    "STRATA_Q36_HO_FAST": "1", "STRATA_KQ_PREFETCH": "2", "STRATA_Q36_MTP_KVONLY": "1",
     # prompts
     "STRATA_Q36_LM": "1", "STRATA_Q36_LM_TAIL": "1", "STRATA_Q36_FA2": "1", "STRATA_Q36_FA2P": "1", "STRATA_Q36_FA2Q": "1",
     "STRATA_Q36_FA2_SEG": "32768", "STRATA_Q36_ATT_MFLOATS": "13", "STRATA_Q36_GDN_TC": "1", "STRATA_Q36_GDN_COLS": "16",

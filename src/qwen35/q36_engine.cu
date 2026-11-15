@@ -75,6 +75,9 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>   // WH1: _mm_pause in the handoff's routing-flag spin (STRATA_Q36_HO_FAST)
+#endif
 
 void q36_swiglu_q8mmq(const float* gu, void* y, int64_t rows, int64_t n_ff, int lay, cudaStream_t st);   // q36_swq.cu (TP2)
 namespace {
@@ -2543,6 +2546,31 @@ __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t
 }
 constexpr int kArgBlocks = 128;   // (the row stride of k_argmax's partials)
 
+/// M6 (STRATA_Q36_DRAFT_PMIN): a draft row's top probability, *out = 1 / sum_i exp(x_i - max) over x[0 .. n).
+/// One block, blockDim a multiple of 32 (<= 1024). Float math: it only decides whether to draft.
+__global__ void k_pmax(const float* x, int n, float* out) {
+    __shared__ float sh[32];
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31, nw = (blockDim.x + 31) >> 5;
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) mx = fmaxf(mx, x[i]);
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if (l == 0) sh[w] = mx;
+    __syncthreads();
+    mx = sh[0];
+    for (int k = 1; k < nw; ++k) mx = fmaxf(mx, sh[k]);
+    __syncthreads();
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += __expf(x[i] - mx);
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if (l == 0) sh[w] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int k = 0; k < nw; ++k) t += sh[k];
+        *out = t > 0.f ? 1.f / t : 0.f;
+    }
+}
+
 // TD1 (Q36-T, STRATA_Q36_GPU_TOPK=1): the sampler's candidates on the GPU. A logit's key orders the logits by value, high
 // first, ties by the lowest id (the host sampler's order); k_topk_chunk sorts a chunk of 2048 keys (bitonic, one block)
 // and keeps its first K, run again on the kept keys until one chunk is left: the row's exact top K in order.
@@ -3811,6 +3839,16 @@ struct Engine {
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
     int32_t *tok_m = nullptr, *pos0_m = nullptr, *pick_m = nullptr;
+    // M6 (STRATA_Q36_DRAFT_PMIN=p, default 0 = off): after each draft, its top probability under the draft head (pmax_m,
+    // copied with the pick to hpmax); below p no later draft is run this step (the verify window gets fewer rows)
+    static float draft_pmin() {
+        static const float p = [] { const char* v = std::getenv("STRATA_Q36_DRAFT_PMIN"); return v ? (float) std::atof(v) : 0.f; }();
+        return p;
+    }
+    float* pmax_m = nullptr;   // device: the last draft row's top probability
+    float* hpmax = nullptr;    // pinned: its host copy
+    int last_skipped = 0;      // drafts the last speculative step did not run
+    long long pmin_skip = 0, pmin_all = 0;   // per request: drafts skipped, drafts that would have run
     // graphs: [0] the decode step, [T] a verify window of T rows, mtp1 the MTP draft step
     // (the graphs hold the current session's state pointers as kernel arguments: one set per session)
     struct GSet {
@@ -3982,6 +4020,21 @@ struct Engine {
     static bool ho_log() {
         static const bool on = [] { const char* v = std::getenv("STRATA_Q36_HO_LOG"); return v && v[0] == '1'; }();
         return on;
+    }
+    /// WH1 (STRATA_Q36_HO_FAST=1, opt-in): host-side only, the same jobs in the same order (the same bits): cpu_part's
+    /// per-call heap scratch reused (wh_open / wh_touched / wh_quant), a graph launch's CPU jobs queued before
+    /// cudaGraphLaunch, _mm_pause in the routing-flag spin.
+    static bool ho_fast() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_HO_FAST"); return v && v[0] == '1'; }();
+        return on;
+    }
+    std::vector<int> wh_open;       // expert -> its job with room (-1: none), reset for wh_touched after each call
+    std::vector<int> wh_touched;    // the experts set in wh_open this call
+    std::vector<char> wh_quant;     // row t's activations quantized this call
+    static inline void ho_relax() {
+#if defined(_M_X64) || defined(__x86_64__)
+        _mm_pause();
+#endif
     }
     void ho_push(const HoJob& j) {
         if (ho_log()) std::fprintf(stderr, "HOLOG push li %d T %d seq %u\n", j.li, j.T, j.seq), std::fflush(stderr);
@@ -5135,6 +5188,10 @@ struct Engine {
             tok_m = dalloc_t<int32_t>(T);
             pos0_m = dalloc_t<int32_t>(1);
             pick_m = dalloc_t<int32_t>(1);
+            if (draft_pmin() > 0) {   // M6
+                pmax_m = dalloc(1);
+                CK(cudaHostAlloc((void**) &hpmax, 4 * sizeof(float), cudaHostAllocDefault));
+            }
         }
         sess.resize((size_t) n_sess);
         gsets.resize((size_t) n_sess);
@@ -6173,6 +6230,9 @@ struct Engine {
                 k_attn_prep<float><<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate,
                     rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
                     m->rope_base, m->eps, d_delta, mtab_now, rs);
+            // WK1 (STRATA_Q36_MTP_KVONLY=1): the MTP block's prompt pass needs only the K / V cells k_attn_prep just
+            // wrote (the same projections and kernel as the full pass): no attention, output projection, residual or MoE
+            if (kv_only_pass) return;
             if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
@@ -6674,7 +6734,7 @@ struct Engine {
             CK(cudaMemcpyAsync(pos0_m, lm_pos + j, 4, cudaMemcpyDeviceToDevice, st));
             lm_first = j == 0;
             lm_last = j == nsub - 1;
-            forward_mtp(Tj, p0 + (int64_t) j * T, seeds, false, false);
+            forward_mtp(Tj, p0 + (int64_t) j * T, seeds, false, false, mtp_kvonly_on());
         }
         lm_active = false;
     }
@@ -6790,10 +6850,12 @@ struct Engine {
             mm(v, hn, logits_m, 1);
             k_argmax<<<dim3(kArgBlocks, 1), kThreads, 0, st>>>(logits_m, draft_n, pick_m, amv, ami, false);
             k_argmax<<<dim3(1, 1), kThreads, 0, st>>>(logits_m, kArgBlocks, pick_m, amv, ami, true);
+            draft_pmax(draft_n);
             return;
         }
         if (!fast_k || draft_n <= 0 || draft_n >= g.n_vocab || draft_n % 8 != 0 || hd.type != 8 || hd.n_in != N || N / 32 != 64) {
             head_rows(hn, 1, logits_m, pick_m);
+            draft_pmax((int) g.n_vocab);
             return;
         }
         quant(hn, N, 1, q8);
@@ -6808,14 +6870,30 @@ struct Engine {
         }
         k_argmax<<<dim3(kArgBlocks, 1), kThreads, 0, st>>>(logits_m, draft_n, pick_m, amv, ami, false);
         k_argmax<<<dim3(1, 1), kThreads, 0, st>>>(logits_m, kArgBlocks, pick_m, amv, ami, true);
+        draft_pmax(draft_n);
+    }
+    /// M6: the top probability over the n logits the draft's argmax read (off: no launch)
+    void draft_pmax(int n) {
+        if (pmax_m) k_pmax<<<1, 1024, 0, st>>>(logits_m, n, pmax_m);
     }
 
     /// The MTP block over T rows: row t reads token tok_m[t] at position p0 + t (also at *pos0_m) and the seed hidden
     /// seeds[t] (the main model's normed hidden of the position before, or the block's own for a chained draft);
     /// hmtp gets each row's normed output.  `draft`: logits of the last row and its pick (`pick_m`).
-    void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
+    /// WK1 (STRATA_Q36_MTP_KVONLY=1, opt-in): the MTP block's prompt passes (forward_mtp_lm and the chunk-major prompt
+    /// loop; never a draft, never the speculative step's catch-up) compute only the block's K / V cells: embed, the two
+    /// norms, eh_proj, attn_norm, then the attention layer's Q / K / V projections and k_attn_prep (which writes the
+    /// cells), and stop there. The prompt rows' hmtp is never read, so nothing else changes; the MTP layer's experts are
+    /// not streamed nor routed for prompts (its expert-hit counts no longer grow from prompts: a placement-only effect).
+    static bool mtp_kvonly_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_MTP_KVONLY"); return v && v[0] == '1'; }();
+        return on;
+    }
+    bool kv_only_pass = false;   // layer(): return after the attention branch's k_attn_prep (set only by forward_mtp)
+    void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode, bool kv_only = false) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
+        kv_only = kv_only && !draft && !graph_mode && m->mtp.attn;
         kvr_ensure(p0 + T);
         r6_rewind(p0);
         if (T <= kGemmT) sp_build(p0);
@@ -6823,6 +6901,19 @@ struct Engine {
         if (graph_mode && ho_graph) {   // WD1: the pass's epoch, as forward()'s
             k_ho_epoch<<<1, 1, 0, st>>>(ho_ep_d);
             if (ho_tmpl_cur) ++ho_tmpl_cur->eps;
+        }
+        if (kv_only) {   // WK1: no expert stream for the MTP layer (its MoE is skipped), nothing takes or waits for it
+            K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
+            if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
+            k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);
+            k_rms_ld<<<T, kThreads, 0, st>>>(seeds, N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);
+            mm(m->eh_proj, mtp_cat, x, T);
+            k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
+            kv_only_pass = true;
+            layer(m->mtp, m->layers.size(), T, p0, pos0_m, false, false, m->mtp_shnorm, hmtp);
+            kv_only_pass = false;
+            ho_run();
+            return;
         }
         if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq && (!lm_active || lm_first)) {
             drop_xslots();   // the stream overwrites the staging buffers that hold extra slots
@@ -7137,7 +7228,11 @@ struct Engine {
         const auto tw = Clock::now();
         if (ho_log()) std::fprintf(stderr, "HOLOG job li %d T %d seq %u: waiting for routing (rflag %u)\n", j.li, j.T, j.seq,
                                    *(volatile unsigned*) (ho_rflag_h + j.li)), std::fflush(stderr);
-        while (*(volatile unsigned*) (ho_rflag_h + j.li) != j.seq) {
+        if (ho_fast()) {
+            while (*(volatile unsigned*) (ho_rflag_h + j.li) != j.seq) ho_relax();
+        } else {
+            while (*(volatile unsigned*) (ho_rflag_h + j.li) != j.seq) {
+            }
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         hy_wait_ms += ms_since(tw);
@@ -7162,10 +7257,44 @@ struct Engine {
         const auto t0 = Clock::now();
         // the missed entries per expert (up to MAXT tokens per job)
         jobs.clear();
-        std::vector<char> quantized((size_t) T, 0);
         int n_miss = 0;
-        std::map<int, size_t> open;   // expert -> its job with room
         const bool defer = rows_deferred && li < m->layers.size();
+        if (ho_fast()) {   // WH1: the same loop on reused scratch (no map, no per-call vector); jobs in the same order
+            if (wh_open.size() < H.slot_of.size()) wh_open.resize(H.slot_of.size(), -1);
+            wh_quant.assign((size_t) T, 0);   // (no allocation once the capacity is there)
+            wh_touched.clear();
+            if (defer) {
+                if (row_ids.size() < m->layers.size()) row_ids.resize(m->layers.size());
+                row_ids[li].assign(h_ids, h_ids + n_ent);
+            }
+            for (int e = 0; e < n_ent; ++e) {
+                const int x = h_ids[e];
+                if (!defer) H.score[(size_t) x] += 1.0;
+                h_miss[e] = H.slot_of[(size_t) x] < 0;
+                if (!h_miss[e]) continue;
+                ++n_miss;
+                const int t = e / Kp;
+                if (!wh_quant[(size_t) t]) {
+                    C::native_quant_act(H.fmt, h_h + (size_t) t * N, acts + (size_t) t * C::kNativeActBytes);
+                    wh_quant[(size_t) t] = 1;
+                }
+                int& oj = wh_open[(size_t) x];
+                if (oj < 0 || jobs[(size_t) oj].nt == C::MAXT) {
+                    if (oj < 0) wh_touched.push_back(x);
+                    C::ExpertJobMulti j;
+                    j.blob = hptr(li, L, x);   // (V-TIER: its pinned copy when it has one)
+                    jobs.push_back(j);
+                    oj = (int) jobs.size() - 1;
+                }
+                C::ExpertJobMulti& j = jobs[(size_t) oj];
+                j.nact[j.nt] = acts + (size_t) t * C::kNativeActBytes;
+                j.out[j.nt] = cpu_out + (size_t) e * N;
+                ++j.nt;
+            }
+            for (const int x : wh_touched) wh_open[(size_t) x] = -1;
+        } else {
+        std::vector<char> quantized((size_t) T, 0);
+        std::map<int, size_t> open;   // expert -> its job with room
         if (defer) {
             if (row_ids.size() < m->layers.size()) row_ids.resize(m->layers.size());
             row_ids[li].assign(h_ids, h_ids + n_ent);
@@ -7193,6 +7322,7 @@ struct Engine {
             j.out[j.nt] = cpu_out + (size_t) e * N;
             ++j.nt;
         }
+        }   // (the map version, STRATA_Q36_HO_FAST off)
         hy_cpu += n_miss;
         hy_gpu += n_ent - n_miss;
         if (n_miss == 0) {
@@ -7428,6 +7558,23 @@ struct Engine {
             CK(cudaGraphInstantiate(&gx, graph, 0));
             CK(cudaGraphDestroy(graph));
         }
+        if (ho_graph && ho_thread && ho_fast()) {   // WH1: the worker gets this launch's jobs before the launch call
+            // Safe: each job's seq is the epoch this launch's k_ho_epoch leaves on the device (ho_ep_d mirrors ho_ep), and
+            // the worker spins until k_ho_publish of this launch writes exactly that value to the layer's routing flag;
+            // earlier launches wrote smaller epochs, so nothing runs before this launch's routing is in mapped memory.
+            const auto it = ho_tmpls.find(&gx);
+            if (it != ho_tmpls.end() && it->second.eps > 0) {
+                const unsigned ep0 = ho_ep;
+                ho_ep += (unsigned) it->second.eps;
+                for (const auto& j : it->second.jobs) ho_push({j.first, j.second, ho_ep});
+                CK(cudaGraphLaunch(gx, st));
+                if (ho_log())
+                    std::fprintf(stderr, "HOLOG graph launch eps %d jobs %zu ho_ep %u\n", it->second.eps, it->second.jobs.size(), ep0),
+                        std::fflush(stderr);
+                ho_run();
+                return;
+            }
+        }
         CK(cudaGraphLaunch(gx, st));
         if (ho_log()) {
             const auto it = ho_tmpls.find(&gx);
@@ -7591,7 +7738,7 @@ struct Engine {
                     CK(cudaMemcpyAsync(mtp_seed() + N, hmain, (size_t) (T - 1) * N * 4, cudaMemcpyDeviceToDevice, st));
                 CK(cudaMemcpyAsync(tok_m, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
                 CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
-                forward_mtp(T, pos, mtp_seed(), false, false);
+                forward_mtp(T, pos, mtp_seed(), false, false, mtp_kvonly_on());   // (a prompt pass: WK1 applies)
             }
             CK(cudaMemcpyAsync(hlast, hmain + (size_t) (T - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             pos += T;
@@ -8047,13 +8194,27 @@ struct Engine {
         mtp_run(T0, pos - (int64_t) fix.size(), seeds, D > 0);
         if (ho_log()) std::fprintf(stderr, "HOLOG spec: first MTP call queued\n"), std::fflush(stderr);
         drafts.assign((size_t) D, 0);
+        // M6: draft d's top probability below the switch's p: the drafts after it are not run (D becomes d + 1)
+        const bool pm = pmax_m != nullptr;
+        last_skipped = 0;
+        if (pm) pmin_all += D;
+        auto pmin_cut = [&](int d) {
+            if (!pm || d + 1 >= D || hpmax[0] >= draft_pmin()) return false;
+            last_skipped = D - (d + 1);
+            pmin_skip += last_skipped;
+            D = d + 1;
+            drafts.resize((size_t) D);
+            return true;
+        };
         if (D > 0) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
+            if (pm) CK(cudaMemcpyAsync(hpmax, pmax_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[0] = hpin[2];
         }
         w0lap(1);
         if (w0c && D > 0) w0_grab(0);
+        if (D > 0) pmin_cut(0);
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
             hpin[0] = drafts[(size_t) d - 1];
@@ -8065,9 +8226,11 @@ struct Engine {
             if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
             else mtp_run(1, pos + d, seeds, true);
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
+            if (pm) CK(cudaMemcpyAsync(hpmax, pmax_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[(size_t) d] = hpin[2];
             if (w0c) w0_grab(d);
+            if (pmin_cut(d)) break;
         }
         w0lap(2);
         // the verify window
@@ -8133,6 +8296,7 @@ struct Engine {
             std::vector<int32_t> fix, drafts;
             int32_t picks[16];
             spec_step(filler, fix, mtp_d, drafts, picks);
+            pmin_skip = pmin_all = 0;
         }
         CK(cudaStreamSynchronize(st));
         warming = false;
@@ -8473,7 +8637,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
     const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
     // the prompt-only VRAM: the staging pair and the chunk-sized buffer set (alloc_big, after the slots)
-    const size_t big_bytes = E.split_bufs ? E.set_floats(E.big_T) * 4 + ((size_t) 1 << 20) : 0;
+    // WB1 (STRATA_Q36_SLOT_FIX=1): the chunk-sized set allocated in init() (not BIG_LATE) is already out of `fr`: not
+    // subtracted a second time (the slot count: placement only)
+    static const bool slot_fix = [] { const char* v = std::getenv("STRATA_Q36_SLOT_FIX"); return v && v[0] == '1'; }();
+    const size_t big_bytes = E.split_bufs && !(slot_fix && E.big_set.base) ? E.set_floats(E.big_T) * 4 + ((size_t) 1 << 20) : 0;
     const size_t prompt_only = staging + big_bytes;
     size_t slot_bytes = budget2 > prompt_only ? budget2 - prompt_only : 0;
     if (slot_bytes + prompt_only + ((size_t) 256 << 20) > fr)
@@ -9739,7 +9906,7 @@ struct Serve {
                         return w0tk;
                     };
                 const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, smp.needs_logits() ? &draw : nullptr);
-                offered += E.mtp_d;
+                offered += E.mtp_d - E.last_skipped;   // (M6: drafts not run are not offered)
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
                 // answer, max_new): the held tokens say so, so a later request that continues this conversation matches them
@@ -9774,6 +9941,11 @@ struct Serve {
                      "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse,
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
                      decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
+        if (E.pmax_m) {   // M6
+            std::fprintf(stderr, "strata-q36: DRAFT_PMIN %.3f skipped %lld of %lld drafts\n", (double) E.draft_pmin(),
+                         E.pmin_skip, E.pmin_all);
+            E.pmin_skip = E.pmin_all = 0;
+        }
         if (E.w0t) E.w0_print_reset(w0_copy, w0_samp);
         if (E.w0c)
             for (int r = 0; r < 4; ++r)
@@ -10146,7 +10318,7 @@ int strata::qwen35::run(int argc, char** argv) {
             gen.push_back(nx);
             if ((int) gen.size() >= n_gen) break;
             const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
-            offered += E.mtp_d;
+            offered += E.mtp_d - E.last_skipped;
             accepted += a;
             fix.assign(drafts.begin(), drafts.begin() + a);
             for (int i = 0; i < a && (int) gen.size() < n_gen; ++i) gen.push_back(drafts[(size_t) i]);
