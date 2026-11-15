@@ -236,6 +236,23 @@ above and the fast setup)
   changes because more experts run on the GPU's kernels); `STRATA_Q36_DRAFT_PMIN=<p>` (stop drafting after a draft whose
   top probability is under p: at 0.3 it skipped under 2% of drafts for 123.1 and moved the text).
 
+**Several requests at once** (`"parallel": N` / `--batch N`; measured 2026-11-15, 4 requests, 500-token coding answers,
+one run each; opt-in, not in the fast setup). The RAM K/V cache (`KV_RAM`, `KV_WINDOW`, `KV_GROW`) runs one session only,
+so these runs leave it out and use 16K or 32K per request.
+- Batch windows with `HO_GRAPH` no longer crash: a window is a CUDA graph only when its hybrid layers can be captured.
+- `STRATA_Q36_ROWS_HO=1`: batch windows use the CPU handoff and the graph.
+- `STRATA_Q36_BATCH_TOPK=1`: each request's token drawn from the GPU's top-k candidates, as `GPU_TOPK` does for one request.
+- `STRATA_Q36_ROWS_SPLIT=1`: the requests are split into two groups on two CUDA streams; the GPU runs one group's layer
+  while the CPU pool computes the other group's missed experts. Logits bitwise equal to the unsplit window (checked in the
+  engine with `STRATA_Q36_SPLIT_CHECK=1` on 19 windows). `STRATA_Q36_SPLIT_PARTS` (2-4) and `STRATA_Q36_SPLIT_STREAMS=1`
+  (one stream) were slower; `STRATA_Q36_ROWS_TIME=1` / `STRATA_Q36_SPLIT_BENCH=1` time the windows.
+- `STRATA_Q36_VRAM_RESERVE_MIB=<n>` (default 768): VRAM kept free below the expert slots (320 gives more slots; with
+  `SLOT_FIX` a placement change).
+- With all of them, `SLOT_FIX`, reserve 320 and `--pool-workers 13`: 16K per request 187-194 tok/s in all, each request
+  47.7-51.8 tok/s (without the split 172-181, 43.9-48.1); 32K 183-187, each 47.0-49.8 (without 164-173). One request at a
+  time on the same settings: 112-123. A 4-request window is ~12.6 ms of GPU work beside ~13.5 ms of CPU experts (memory
+  bandwidth bound), ~17.8 ms in all.
+
 **Diagnostics and measured-but-not-used**
 - `STRATA_Q36_PROF=1/2/3`: prompt stage times, exact per-stage times, decode stage times. `STRATA_POOL_PHASE_TIMING=1`:
   the CPU pool's phases in the summary. `STRATA_Q36_EXPERT_HIST=1`: rows per expert in the prompt's expert passes.

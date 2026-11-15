@@ -3997,7 +3997,7 @@ struct Engine {
     /// host thread launched a layer's ~30 kernels and ran the layer before's CPU experts in turn (decode was host-bound:
     /// hybrid mode has no CUDA graphs). The same jobs in the same order: the same bits.
     struct HoWorker {
-        static constexpr unsigned kCap = 128;
+        static constexpr unsigned kCap = 512;   // (ROWS-SPLIT: 4 parts x 40 layers of jobs a window, queued at once)
         std::thread thr;
         std::mutex mu;
         std::condition_variable cv;
@@ -4082,7 +4082,47 @@ struct Engine {
             k_merge_host<<<n_ent, kThreads, 0, st>>>(eparts, ho_out_d + slot * N, ho_miss_d + slot, N);
         }
     }
-    bool ho_active(size_t li, int T, bool graph_mode) const { return ho && (!graph_mode || ho_graph) && !rows_mode && T <= kHoRows && li < ho_ids.size(); }
+    // ROWS-HO (STRATA_Q36_ROWS_HO=1): batch windows of several sessions (rows_mode) use the handoff too
+    static bool rows_ho() { static const bool on = [] { const char* v = std::getenv("STRATA_Q36_ROWS_HO"); return v && v[0] == '1'; }(); return on; }
+    bool ho_active(size_t li, int T, bool graph_mode) const { return ho && (!graph_mode || ho_graph) && (!rows_mode || rows_ho()) && T <= kHoRows && li < ho_ids.size(); }
+    /// Q36-B4P ROWS-SPLIT (STRATA_Q36_ROWS_SPLIT=1, opt-in, with ROWS_HO): a plain batch window of G >= 2 groups (sessions)
+    /// runs as P parts (STRATA_Q36_SPLIT_PARTS, 2 by default, at most kParts and G; part i = groups [G i / P, G (i+1) / P)),
+    /// software-pipelined layer by layer so that the CPU pool's missed experts of one part run while the GPU runs the
+    /// others' layer work. Enqueue order (P = 2):
+    ///   pre(H0,0) pre(H1,0) | post(H0,0) pre(H0,1) | post(H1,0) pre(H1,1) | ...   CPU jobs: H0_0, H1_0, H0_1, H1_1, ...
+    /// pre = the layer up to the routing's publish, the slot experts and the shared expert; post = the handoff wait, the
+    /// merge and moe_end (the residual and the next layer's norm). Rows of different sessions are independent and the
+    /// kernels compute a row the same way whatever the rows count (checked: STRATA_Q36_SPLIT_CHECK), so each session gets
+    /// the same logits bit for bit. Part i > 0 uses its own handoff slots (state index + i * ho_ns), its own copies of the
+    /// non-row-indexed buffers and, with STRATA_Q36_SPLIT_STREAMS=2 (default), a stream of its own.
+    static constexpr int kParts = 4;
+    static bool rows_split() { static const bool on = [] { const char* v = std::getenv("STRATA_Q36_ROWS_SPLIT"); return v && v[0] == '1'; }(); return on; }
+    size_t ho_ns = 0;          // the real state indices (the handoff arrays hold kParts * ho_ns with ROWS_SPLIT)
+    int ho_off = 0;            // the part being enqueued: its first handoff slot (i * ho_ns)
+    int ho_ahead = 0;          // eager split windows: routings published and not yet waited for
+    bool split_on = false;     // the layers of a split window are being enqueued
+    int lphase = 0;            // layer(): 0 the whole layer, 1 stop before its post part (layer_post)
+    int split_np = 0;          // run_rows -> forward: the parts of this window (0: no split)
+    int split_gb[kParts + 1] = {}, split_rb[kParts + 1] = {};   // their first groups / rows (and the ends)
+    int32_t* d_grow0b = nullptr;   // the groups' first rows relative to their part
+    cudaEvent_t ev_fork = nullptr;
+    static constexpr int kMaxLayers = 64;
+    cudaEvent_t split_pub[kParts][kMaxLayers] = {};   // per part and layer: its routing published (multi-stream order edges)
+    cudaEvent_t pub_ev = nullptr;   // layers_split -> moe_hybrid_gpu: record it right after the publish
+    bool pub_done = false;
+    int split_streams_force = 0;   // SPLIT_BENCH: 1 or 2 overrides the switch
+    int split_parts_force = 0;     // SPLIT_BENCH: overrides STRATA_Q36_SPLIT_PARTS
+    bool bench_nocpu = false;      // SPLIT_BENCH: windows captured without the CPU experts (timing only)
+    /// STRATA_Q36_SPLIT_STREAMS: 2 (default) each part on a stream of its own (the parts' GPU work may overlap too: every
+    /// buffer a part writes is its own); 1 every part on the engine's stream in the pipelined order
+    int split_streams() const {
+        static const int n = [] { const char* v = std::getenv("STRATA_Q36_SPLIT_STREAMS"); return v && v[0] == '1' ? 1 : 2; }();
+        return split_streams_force ? split_streams_force : n;
+    }
+    int split_parts() const {
+        static const int n = [] { const char* v = std::getenv("STRATA_Q36_SPLIT_PARTS"); return v ? std::max(2, std::min(kParts, std::atoi(v))) : 2; }();
+        return split_parts_force ? split_parts_force : n;
+    }
     uint8_t* stage[2] = {};
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
@@ -4971,6 +5011,17 @@ struct Engine {
         size_t floats = 0;
     };
     BufSet small_set, big_set;
+    /// ROWS-SPLIT: part i > 0's own buffers (kVerify rows; the row-indexed others are used at its first row)
+    struct PartBufs {
+        BufSet set;
+        float *logits = nullptr, *ewts = nullptr, *sy = nullptr, *sgate = nullptr;
+        int32_t* ids = nullptr;
+        void *q8 = nullptr, *xq = nullptr, *escr = nullptr;
+        unsigned long long* grp_ptr = nullptr;
+        int32_t *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr;
+        cudaStream_t st = nullptr;
+        cudaEvent_t ev = nullptr;   // the join
+    } pb[kParts];
     bool split_bufs = false, big_on = false;
     size_t big_T = 0;
     static size_t al64(size_t n) { return (n + 63) & ~(size_t) 63; }   // 256-byte steps
@@ -5247,6 +5298,38 @@ struct Engine {
             d_grow0 = dalloc_t<int32_t>(kVerify);
             d_gcnt = dalloc_t<int32_t>(kVerify);
             CK(cudaHostAlloc((void**) &hrow, 128 * sizeof(int32_t), cudaHostAllocDefault));
+            if (rows_split()) {   // Q36-B4P: the parts' own buffers (kVerify rows each)
+                const size_t R = (size_t) kVerify;
+                d_grow0b = dalloc_t<int32_t>(R);
+                size_t max_in1 = N;
+                for (const Layer& L : m->layers)
+                    for (const Mat* w : {&L.qkv, &L.zg, &L.ssm_out, &L.wq, &L.wk, &L.wv, &L.wo, &L.sh_gate, &L.sh_up, &L.sh_down})
+                        max_in1 = std::max(max_in1, (size_t) w->n_in);
+                for (int i = 1; i < kParts; ++i) {
+                    PartBufs& b = pb[i];
+                    b.ids = dalloc_t<int32_t>(R * Kp);
+                    b.logits = dalloc(R * (g.n_expert + 1));
+                    b.ewts = dalloc(R * Kp);
+                    b.sy = dalloc(R * N);
+                    b.sgate = dalloc(R);
+                    alloc_set(b.set, R, dalloc(set_floats(R)));
+                    CK(cudaMalloc(&b.q8, K::native_q8_1_bytes((int) max_in1, 1) * R));
+                    CK(cudaMalloc(&b.xq, K::native_q8_1_bytes((int) N, 1) * R));
+                    CK(cudaMalloc(&b.escr, K::native_expert_scratch_bytes((int64_t) (R * Kp), (int64_t) FF)));
+                    b.grp_ptr = dalloc_t<unsigned long long>(std::min<size_t>(R * Kp, (size_t) g.n_expert) + 1);
+                    b.grp_start = dalloc_t<int32_t>(std::min<size_t>(R * Kp, (size_t) g.n_expert) + 1);
+                    b.n_groups = dalloc_t<int32_t>(1);
+                    b.ent_dst = dalloc_t<int32_t>(R * Kp);
+                    b.ent_tok = dalloc_t<int32_t>(R * Kp);
+                    CK(cudaStreamCreateWithFlags(&b.st, cudaStreamNonBlocking));
+                    CK(cudaEventCreateWithFlags(&b.ev, cudaEventDisableTiming));
+                }
+                CK(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming));
+                for (auto& row : split_pub)
+                    for (auto& e : row) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_ROWS_SPLIT=1: batch windows as %d pipelined parts (%d stream%s)\n",
+                             split_parts(), split_streams(), split_streams() > 1 ? "s" : "");
+            }
         }
         if (vision) {
             d_mtab = dalloc_t<int32_t>((size_t) ctx * 3);
@@ -6519,12 +6602,12 @@ struct Engine {
         const bool one = T == 1;
         // a decode batch of up to 8 rows takes the router and the shared expert's gate in one product too (rows of 257) when the fused
         // router follows; the prompt chunks and the checks keep the separate products
-        const bool ext = one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8);
+        const bool ext = moe_ext(T);
         if (ext) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, T);
         else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
-        const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
+        const bool hy_rows = hy_rows_at(li, T);
         const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
         if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
@@ -6627,8 +6710,22 @@ struct Engine {
             mm(L.sh_down, shh, sy, T);
         }
         if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
+        if (lphase == 1) return;   // ROWS-SPLIT: layer_post later (prow is null: T <= kGemmT)
+        layer_post(li, T, hy_rows, prow, ext, wn, hout);
+    }
+    /// The router and the shared expert's gate in one product (see layer())
+    bool moe_ext(int T) const {
+        const auto& g = m->g;
+        const int Kp = (int) m->top_k;
+        return T == 1 || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8);
+    }
+    /// layer(): the hybrid rows path (a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch)
+    bool hy_rows_at(size_t li, int T) const { return lhy(li) && (T <= hybrid_t || !main_hybrid); }
+    /// layer()'s end: the CPU pool's experts merged (the handoff wait), then the combine, the shared expert's gate, the
+    /// residual add and the next norm in one launch
+    void layer_post(size_t li, int T, bool hy_rows, const int32_t* prow, bool ext, const float* wn, float* hout) {
+        const auto& g = m->g;
         if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
-        // the combine, the shared expert's gate, the residual add and the next norm in one launch
         moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
         pmark("shared expert + combine");
     }
@@ -6781,6 +6878,8 @@ struct Engine {
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(x, d_img, d_map, N);   // a picture's cells take its rows
         k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
+        if (split_np > 1 && rows_mode && !verify) layers_split(T, p0, graph_mode);
+        else
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
             layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
@@ -6825,6 +6924,146 @@ struct Engine {
             std::fprintf(stderr, "strata-q36 prof: T %d at %lld: forward %.0f ms, expert copies %.0f ms on the GPU, %.0f ms on the host, %.0f ms waited (%zu layers)\n", T,
                          (long long) p0, ms_since(prof_t0), copy_ms, prof_host_ms, prof_wait_ms, prof_n);
         }
+    }
+    /// ROWS-SPLIT (see rows_split): the main layers of a plain batch window as split_np parts (part i: groups
+    /// [split_gb[i], split_gb[i+1]), rows [split_rb[i], split_rb[i+1])), enqueued in the pipelined order
+    /// pre(0,0) .. pre(P-1,0), then per layer l: post(0,l) pre(0,l+1) post(1,l) pre(1,l+1) ... (the handoff worker takes
+    /// the CPU jobs in that order). A part's rows: the row-indexed buffers (x, h, hmain, y, alpha / beta, k / v, the shared
+    /// expert's, the attention partials, the CPU rows' upload) at its first row, its row and group tables; part i > 0 has
+    /// its own copies of the rest (pb[i]: the mixer's set, the q8_1 images, the routing and grouping, the expert parts and
+    /// scratch, the shared expert's output and gate) and its own handoff slots. With split_streams() > 1 part i > 0 runs
+    /// on pb[i].st, forked from and joined back to the engine's stream: no buffer is written by two parts.
+    void layers_split(int T, int64_t p0, bool graph_mode) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, Kp = (int) m->top_k, H = (int) g.n_head;
+        const size_t nL = m->layers.size();
+        const int P = split_np;
+        (void) T;
+        // the engine's pointers, put back at the end
+        cudaStream_t const st0 = st;
+        float* const x0 = x;
+        float* const h0 = h;
+        float* const y0 = y;
+        float* const al0 = alpha;
+        float* const be0 = beta;
+        float* const kx0 = kx;
+        float* const vx0 = vx;
+        float* const sgb0 = sg;
+        float* const sub0 = su;
+        float* const shh0 = shh;
+        float* const pacc0 = pacc;
+        float* const pm0 = pm;
+        float* const pl0 = pl;
+        float* const ecpu0 = ecpu;
+        int32_t* const dmiss0 = d_miss;
+        PartBufs b0;
+        b0.logits = logits_r; b0.ids = ids; b0.ewts = ewts; b0.sy = sy; b0.sgate = sgate; b0.q8 = q8; b0.xq = xq;
+        b0.escr = escr; b0.grp_ptr = grp_ptr; b0.grp_start = grp_start; b0.n_groups = n_groups; b0.ent_dst = ent_dst;
+        b0.ent_tok = ent_tok; b0.st = st0;
+        b0.set.qkv = qkv; b0.set.hc = hc; b0.set.z = z; b0.set.gdn_y = gdn_y; b0.set.qg = qg; b0.set.q = q;
+        b0.set.gate = gate; b0.set.att = att; b0.set.eparts = eparts; b0.set.mq_gu = mq_gu; b0.set.mq_h = mq_h;
+        int32_t* const rc0 = d_rcell;
+        int32_t* const rs0 = d_rslot;
+        int32_t* const rd0 = d_rdelta;
+        int32_t* const gs0 = d_gslot;
+        int32_t* const gr0 = d_grow0;
+        int32_t* const gc0 = d_gcnt;
+        const int G0 = rows_G;
+        const bool multi = split_streams() > 1;
+        const size_t HV = (size_t) g.ssm_v_heads, KVD = (size_t) g.n_head_kv * g.head_dim, FS = (size_t) g.n_ff_shexp;
+        auto use = [&](int k) {
+            const size_t r = (size_t) split_rb[k];
+            const PartBufs& b = k ? pb[k] : b0;
+            st = (k && multi) ? b.st : st0;
+            x = x0 + r * N;
+            h = h0 + r * N;
+            y = y0 + r * N;
+            alpha = al0 + r * HV;
+            beta = be0 + r * HV;
+            kx = kx0 + r * KVD;
+            vx = vx0 + r * KVD;
+            sg = sgb0 + r * FS;
+            su = sub0 + r * FS;
+            shh = shh0 + r * FS;
+            pacc = pacc0 + r * H * n_chunk * g.head_dim;   // (rows (t - t0) * H + head, n_chunk partials each)
+            pm = pm0 + r * H * n_chunk;
+            pl = pl0 + r * H * n_chunk;
+            ecpu = ecpu0 + r * Kp * N;
+            d_miss = dmiss0 + r * Kp;
+            use_set(b.set);
+            logits_r = b.logits; ids = b.ids; ewts = b.ewts; sy = b.sy; sgate = b.sgate; q8 = b.q8; xq = b.xq;
+            escr = b.escr; grp_ptr = b.grp_ptr; grp_start = b.grp_start; n_groups = b.n_groups; ent_dst = b.ent_dst;
+            ent_tok = b.ent_tok;
+            d_rcell = rc0 + r;
+            d_rslot = rs0 + r;
+            d_rdelta = rd0 + r;
+            d_gslot = gs0 + split_gb[k];
+            d_grow0 = d_grow0b + split_gb[k];
+            d_gcnt = gc0 + split_gb[k];
+            rows_G = split_gb[k + 1] - split_gb[k];
+            ho_off = k * (int) ho_ns;
+        };
+        auto rows = [&](int k) { return split_rb[k + 1] - split_rb[k]; };
+        auto wn = [&](size_t l) { return l + 1 == nL ? m->out_norm : m->layers[l + 1].attn_norm; };
+        auto hout = [&](int k, size_t l) { return l + 1 == nL ? hmain + (size_t) split_rb[k] * N : h; };   // (after use(k))
+        // the publish events (multi): part k's post of layer l waits for the routing of the CPU job before it in the
+        // worker's order to be published, so that no part's handoff wait can be scheduled ahead of a publish the worker
+        // needs first (the parts' streams then cannot deadlock even if the GPU ran them one after the other)
+        bool pub_rec[kParts][kMaxLayers] = {};
+        auto pre = [&](int k, size_t l) {
+            use(k);
+            pub_ev = multi && l < (size_t) kMaxLayers ? split_pub[k][l] : nullptr;
+            pub_done = false;
+            lphase = 1;
+            layer(m->layers[l], l, rows(k), p0, pos0, graph_mode, false, wn(l), hout(k, l));
+            lphase = 0;
+            if (pub_ev && pub_done) pub_rec[k][l] = true;
+            pub_ev = nullptr;
+        };
+        auto post = [&](int k, size_t l) {
+            use(k);
+            if (multi) {   // the job before (k, l) in the worker's order
+                int pk = k - 1, plr = (int) l;
+                if (split_serial) { pk = k; plr = (int) l - 1; if (plr < 0) { pk = k - 1; plr = (int) nL - 1; } }
+                else if (pk < 0) { pk = P - 1; plr = (int) l - 1; }
+                if (pk >= 0 && plr >= 0 && pk != k && plr < kMaxLayers && pub_rec[pk][plr])
+                    CK(cudaStreamWaitEvent(st, split_pub[pk][plr], 0));
+            }
+            layer_post(l, rows(k), hy_rows_at(l, rows(k)), nullptr, moe_ext(rows(k)), wn(l), hout(k, l));
+        };
+        if (multi) {   // the parts' streams after everything enqueued so far (the embeddings, the first norm)
+            CK(cudaEventRecord(ev_fork, st0));
+            for (int k = 1; k < P; ++k) CK(cudaStreamWaitEvent(pb[k].st, ev_fork, 0));
+        }
+        split_on = true;
+        if (split_serial) {   // (SPLIT_CHECK B: the parts one after the other)
+            for (int k = 0; k < P; ++k)
+                for (size_t l = 0; l < nL; ++l) pre(k, l), post(k, l);
+        } else {
+            for (int k = 0; k < P; ++k) pre(k, 0);
+            for (size_t l = 0; l < nL; ++l)
+                for (int k = 0; k < P; ++k) {
+                    post(k, l);
+                    if (l + 1 < nL) pre(k, l + 1);
+                }
+        }
+        split_on = false;
+        if (multi) {   // the engine's stream waits for the parts' rows
+            for (int k = 1; k < P; ++k) {
+                CK(cudaEventRecord(pb[k].ev, pb[k].st));
+                CK(cudaStreamWaitEvent(st0, pb[k].ev, 0));
+            }
+        }
+        st = st0;
+        x = x0; h = h0; y = y0; alpha = al0; beta = be0; kx = kx0; vx = vx0; sg = sgb0; su = sub0; shh = shh0;
+        pacc = pacc0; pm = pm0; pl = pl0; ecpu = ecpu0; d_miss = dmiss0;
+        use_set(b0.set);
+        logits_r = b0.logits; ids = b0.ids; ewts = b0.ewts; sy = b0.sy; sgate = b0.sgate; q8 = b0.q8; xq = b0.xq;
+        escr = b0.escr; grp_ptr = b0.grp_ptr; grp_start = b0.grp_start; n_groups = b0.n_groups; ent_dst = b0.ent_dst;
+        ent_tok = b0.ent_tok;
+        d_rcell = rc0; d_rslot = rs0; d_rdelta = rd0; d_gslot = gs0; d_grow0 = gr0; d_gcnt = gc0;
+        rows_G = G0;
+        ho_off = 0;
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
@@ -7142,8 +7381,12 @@ struct Engine {
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int64_t n_ent = (int64_t) T * Kp;
         if (ho_active(li, T, cur_graph_mode)) {   // the routing to mapped memory and its flag (see k_ho_publish)
-            k_ho_publish<<<1, 1024, 0, st>>>(ids, (int) n_ent, h, T * N, ho_ids_d[li], ho_h_d[li], ho_rflag_d + li, ho_seq + 1,
-                                             cur_graph_mode ? ho_ep_d : nullptr);
+            const size_t hi = li + (size_t) ho_off;   // (ROWS_SPLIT: H1's own slot)
+            if (pub_ev) pub_done = true;
+            k_ho_publish<<<1, 1024, 0, st>>>(ids, (int) n_ent, h, T * N, ho_ids_d[hi], ho_h_d[hi], ho_rflag_d + hi,
+                                             ho_seq + 1 + (unsigned) ho_ahead, cur_graph_mode ? ho_ep_d : nullptr);
+            if (pub_ev) CK(cudaEventRecord(pub_ev, st));   // (ROWS-SPLIT: see layers_split)
+            if (split_on && !cur_graph_mode) ++ho_ahead;   // (eager split: the other half publishes before this one waits)
         } else {
             CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
@@ -7157,30 +7400,32 @@ struct Engine {
     /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
     /// rows uploaded and merged into the entries' rows.
     void moe_hybrid_cpu(size_t li, int T) {
-        if (oracle() == 4) return;   // TO1: the GPU-only step (no CPU experts, no handoff wait)
+        if (oracle() == 4 || bench_nocpu) return;   // TO1: the GPU-only step (no CPU experts, no handoff wait); SPLIT_BENCH
 #if defined(STRATA_Q36_CPU_POOL)
         namespace C = strata::kernels::cpu;
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int n_ent = T * Kp;
+        const size_t hi = li + (size_t) ho_off;   // the handoff slot (ROWS_SPLIT: H1's after the real state indices)
         if (ho_active(li, T, cur_graph_mode) && cur_graph_mode) {   // R1: captured; the jobs queued at each launch
-            const size_t slot = li * (size_t) kHoRows * Kp;
-            k_ho_wait<<<1, 32, 0, st>>>(ho_flag_d + li, 0, ho_ep_d);
+            const size_t slot = hi * (size_t) kHoRows * Kp;
+            k_ho_wait<<<1, 32, 0, st>>>(ho_flag_d + hi, 0, ho_ep_d);
             ho_merge(slot, n_ent, N);
-            if (ho_tmpl_cur) ho_tmpl_cur->jobs.push_back({(int) li, T});
+            if (ho_tmpl_cur) ho_tmpl_cur->jobs.push_back({(int) hi, T});
             return;
         }
         if (ho_active(li, T, cur_graph_mode)) {   // the GPU waits for this layer's flag; the host fills it in ho_run()
             const unsigned seq = ++ho_seq;
-            const size_t slot = li * (size_t) kHoRows * Kp;
-            k_ho_wait<<<1, 32, 0, st>>>(ho_flag_d + li, seq);
+            if (ho_ahead > 0) --ho_ahead;
+            const size_t slot = hi * (size_t) kHoRows * Kp;
+            k_ho_wait<<<1, 32, 0, st>>>(ho_flag_d + hi, seq);
             ho_merge(slot, n_ent, N);
             if (ho_thread) {   // the worker thread takes it; the queued launches to the GPU now (WDDM batches them)
-                ho_push({(int) li, T, seq});
+                ho_push({(int) hi, T, seq});
                 (void) cudaStreamQuery(st);
                 return;
             }
-            ho_pending.push_back({(int) li, T, seq});
+            ho_pending.push_back({(int) hi, T, seq});
             // CUDA: the earlier layers' CPU parts now, one layer behind the enqueue. A whole forward queued first (~1,200
             // launches) filled the launch queue: the host blocked in a launch while the GPU waited at layer 0's flag.
             ho_run(1);
@@ -7237,7 +7482,9 @@ struct Engine {
         std::atomic_thread_fence(std::memory_order_acquire);
         hy_wait_ms += ms_since(tw);
         const size_t slot = (size_t) j.li * kHoRows * Kp;
-        cpu_part((size_t) j.li, j.T, ho_ids[(size_t) j.li], ho_h[(size_t) j.li], ho_out_h + slot * N, ho_miss_h + slot);
+        const bool later = ho_ns > 0 && (size_t) j.li >= ho_ns;   // ROWS_SPLIT: a later part's job (its layer j.li % ho_ns)
+        cpu_part(later ? (size_t) j.li % ho_ns : (size_t) j.li, j.T, ho_ids[(size_t) j.li], ho_h[(size_t) j.li], ho_out_h + slot * N,
+                 ho_miss_h + slot, later);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         *(volatile unsigned*) (ho_flag_h + j.li) = j.seq;
 #else
@@ -7246,7 +7493,7 @@ struct Engine {
     }
     /// The entries without a slot of layer li on the pool: ids / hh the routing's copies on the host, the rows into
     /// out (entry e at e * N) and miss[e] set for each; returns how many there were.
-    int cpu_part(size_t li, int T, const int32_t* h_ids, const float* h_h, float* cpu_out, int32_t* h_miss) {
+    int cpu_part(size_t li, int T, const int32_t* h_ids, const float* h_h, float* cpu_out, int32_t* h_miss, bool append = false) {
 #if defined(STRATA_Q36_CPU_POOL)
         namespace C = strata::kernels::cpu;
         const auto& g = m->g;
@@ -7265,7 +7512,8 @@ struct Engine {
             wh_touched.clear();
             if (defer) {
                 if (row_ids.size() < m->layers.size()) row_ids.resize(m->layers.size());
-                row_ids[li].assign(h_ids, h_ids + n_ent);
+                if (append) row_ids[li].insert(row_ids[li].end(), h_ids, h_ids + n_ent);   // (ROWS_SPLIT: H1 after H0)
+                else row_ids[li].assign(h_ids, h_ids + n_ent);
             }
             for (int e = 0; e < n_ent; ++e) {
                 const int x = h_ids[e];
@@ -7297,7 +7545,8 @@ struct Engine {
         std::map<int, size_t> open;   // expert -> its job with room
         if (defer) {
             if (row_ids.size() < m->layers.size()) row_ids.resize(m->layers.size());
-            row_ids[li].assign(h_ids, h_ids + n_ent);
+            if (append) row_ids[li].insert(row_ids[li].end(), h_ids, h_ids + n_ent);
+            else row_ids[li].assign(h_ids, h_ids + n_ent);
         }
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
@@ -7786,8 +8035,18 @@ struct Engine {
 
     void run_graph_key(int key, const std::function<void()>& body) {
         if (!use_graph) { body(); return; }
+        if (!rows_graph()) {   // eager (the body reads use_graph as its graph_mode)
+            use_graph = false;
+            body();
+            use_graph = true;
+            return;
+        }
         graph_run(row_graphs[key], body);
     }
+    /// A batch window as a graph only where its hybrid layers can be captured: with the handoff in rows mode (ROWS-HO), or
+    /// with no hybrid main layer. Else eager: the plain hybrid path copies the routing to the host and waits inside the layer,
+    /// which a capture cannot hold (the crash of 2026-11-15 with HO_GRAPH and two slots).
+    bool rows_graph() const { return use_graph && (!main_hybrid || (rows_ho() && ho_graph)); }
 
     /// One window over the groups' rows.  `verify`: a verify window - the GDN state is read, not written (commit_rows writes
     /// it for the kept rows) and the sessions' positions stay.  The greedy picks end up in rows_pick (one per row), every
@@ -7818,16 +8077,41 @@ struct Engine {
         CK(cudaMemcpyAsync(d_gslot, hrow + 40, (size_t) G * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_grow0, hrow + 48, (size_t) G * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_gcnt, hrow + 56, (size_t) G * 4, cudaMemcpyHostToDevice, st));
+        // ROWS-SPLIT: a plain window of an even number of groups as two pipelined halves (only with the rows' handoff)
+        // (odd G: only with more than two parts, where each session can be a part of its own)
+        const bool split = rows_split() && d_grow0b && !verify && G >= 2 && ho && rows_ho() && ho_ns > 0 &&
+                           ho_ids.size() >= (size_t) kParts * ho_ns && main_hybrid && (G % 2 == 0 || split_parts() > 2);
+        if (split) split_plan(G, T);
         mtab_now = nullptr;
         map_on = false;
         rows_mode = true;
         rows_G = G;
         rows_deferred = true;
-        run_graph_key((verify ? 1000 : 0) + G * 10 + (T - G), [&] { forward(T, pmax, T, use_graph, verify); });
+        const bool chk = split && split_check_due();
+        if (chk) split_snap(gr, G, true);
+        static const bool rt_on = std::getenv("STRATA_Q36_ROWS_TIME") != nullptr;   // Q36-B4P diagnostics: windows timed
+        const auto rt0 = Clock::now();
+        const double rt_cpu0 = hy_cpu_ms, rt_wait0 = hy_wait_ms;
+        run_graph_key((split ? split_key() : 0) + (verify ? 1000 : 0) + G * 10 + (T - G), [&] { forward(T, pmax, T, use_graph, verify); });
+        if (chk) split_check_run(gr, G, T, pmax);
+        if (split && split_bench_due()) split_bench(gr, G, T, pmax);
+        split_np = 0;
         rows_deferred = false;
         rows_mode = false;
         CK(cudaMemcpyAsync(hrow + 32, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (rt_on && !chk && !verify) {
+            RowsTime& r = rows_time[(split ? 100 : 0) + G];
+            ++r.n;
+            r.wall += ms_since(rt0);
+            r.cpu += hy_cpu_ms - rt_cpu0;
+            r.wait += hy_wait_ms - rt_wait0;
+            if (r.n % 256 == 0) {
+                std::fprintf(stderr, "strata-q36 rows time: split %d G %d: %lld windows, %.2f ms a window, CPU experts %.2f ms, "
+                             "handoff worker waiting for routing %.2f ms\n", split ? 1 : 0, G, r.n, r.wall / r.n, r.cpu / r.n, r.wait / r.n);
+                r = RowsTime();
+            }
+        }
         for (int r = 0; r < T; ++r) rows_pick[r] = hrow[32 + r];
         if (!verify)
             for (int g = 0; g < G; ++g) sess[(size_t) gr[g].slot].pos += gr[g].n;
@@ -7838,6 +8122,161 @@ struct Engine {
             tier_commit();
             if (++win_count % rebal_every() == 0) rebalance(rebal_swaps());
         }
+    }
+    /// ROWS-SPLIT check (STRATA_Q36_SPLIT_CHECK=N, test only): the first N split windows (then every 64th) run four times
+    /// from the same state (the windows' sessions' delta-net states saved to the host and put back; the K / V cells are
+    /// rewritten with the same cells): A the pipelined split, A2 it again, B the halves one after the other (no pipelining:
+    /// the same kernels, T of a half), C unsplit. A = A2 = B bitwise says the pipelining reads and writes the right
+    /// buffers; C - A is what the rows count changes in the kernels. The window then goes on with C's picks.
+    int split_chk_n = -1, split_chk_i = 0;
+    struct RowsTime { long long n = 0; double wall = 0, cpu = 0, wait = 0; };
+    std::map<int, RowsTime> rows_time;   // STRATA_Q36_ROWS_TIME: by (split, groups)
+    bool split_serial = false;
+    std::vector<std::vector<uint8_t>> split_saved;
+    bool split_check_due() {
+        if (split_chk_n < 0) {
+            const char* v = std::getenv("STRATA_Q36_SPLIT_CHECK");
+            split_chk_n = v ? std::max(0, std::atoi(v)) : 0;
+        }
+        if (split_chk_n == 0) return false;
+        const int i = split_chk_i++;
+        return i < split_chk_n || i % 64 == 0;
+    }
+    void split_snap(const Group* gr, int G, bool save) {
+        CK(cudaStreamSynchronize(st));
+        size_t k = 0;
+        if (save) split_saved.clear();
+        for (int g = 0; g < G; ++g) {
+            Sess& ss = sess[(size_t) gr[g].slot];
+            for (size_t l = 0; l < m->layers.size(); ++l) {
+                if (m->layers[l].attn) continue;
+                void* ptr[2] = {ss.conv[l], ss.S[l]};
+                const size_t nb[2] = {conv_bytes(), s_bytes()};
+                for (int j = 0; j < 2; ++j, ++k) {
+                    if (save) {
+                        split_saved.emplace_back(nb[j]);
+                        CK(cudaMemcpy(split_saved.back().data(), ptr[j], nb[j], cudaMemcpyDeviceToHost));
+                    } else {
+                        CK(cudaMemcpy(ptr[j], split_saved[k].data(), nb[j], cudaMemcpyHostToDevice));
+                    }
+                }
+            }
+        }
+        CK(cudaDeviceSynchronize());
+    }
+    /// SPLIT_BENCH (STRATA_Q36_SPLIT_BENCH=W, diagnostics): at the W-th split window, the window replayed from the same state
+    /// (restored before each replay) 16 times per variant, each timed from the launch to the stream's end: unsplit, split on
+    /// two streams, split on one, and the same three captured without the CPU experts (the GPU's own time; garbage rows)
+    int split_bench_w = -1, split_bench_i = 0;
+    bool split_bench_due() {
+        if (split_bench_w < 0) {
+            const char* v = std::getenv("STRATA_Q36_SPLIT_BENCH");
+            split_bench_w = v ? std::max(0, std::atoi(v)) : 0;
+        }
+        return split_bench_w > 0 && ++split_bench_i == split_bench_w;
+    }
+    void split_bench(const Group* gr, int G, int T, int64_t pmax) {
+        split_snap(gr, G, true);   // (the state after the window: the replays start from it, and it is put back at the end)
+        std::vector<float> keep_lg((size_t) T * m->g.n_vocab);
+        std::vector<int32_t> keep_pk((size_t) T);
+        CK(cudaMemcpy(keep_lg.data(), logits, keep_lg.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(keep_pk.data(), pick, keep_pk.size() * 4, cudaMemcpyDeviceToHost));
+        const int key = G * 10 + (T - G);
+        struct V { const char* name; int parts; int streams; bool nocpu; };
+        const V vs[] = {{"unsplit", 0, 0, false}, {"2 parts, streams", 2, 2, false}, {"2 parts, one stream", 2, 1, false},
+                        {"4 parts, streams", 4, 2, false}, {"3 parts, streams", 3, 2, false},
+                        {"unsplit, no CPU", 0, 0, true}, {"2 parts, streams, no CPU", 2, 2, true},
+                        {"2 parts, one stream, no CPU", 2, 1, true}, {"4 parts, streams, no CPU", 4, 2, true}};
+        for (const V& v : vs) {
+            if (v.parts > G) continue;
+            double tot = 0, mn = 1e9;
+            const double cpu0 = hy_cpu_ms, wait0 = hy_wait_ms;
+            for (int rep = 0; rep < 17; ++rep) {
+                split_snap(gr, G, false);
+                split_parts_force = v.parts;
+                split_streams_force = v.streams;
+                bench_nocpu = v.nocpu;
+                if (v.parts) split_plan(G, T);
+                else split_np = 0;
+                const int k = v.parts ? split_key() + key : (v.nocpu ? 20000 : 0) + key;
+                const auto t0 = Clock::now();
+                run_graph_key(k, [&] { forward(T, pmax, T, use_graph, false); });
+                CK(cudaStreamSynchronize(st));
+                const double ms = ms_since(t0);
+                if (rep > 0) tot += ms, mn = std::min(mn, ms);   // (the first: the capture)
+                bench_nocpu = false;
+                split_streams_force = split_parts_force = 0;
+                split_np = 0;
+            }
+            std::fprintf(stderr, "strata-q36 split bench: G %d T %d at %lld: %-28s %.2f ms a window (min %.2f), CPU experts %.2f ms, "
+                         "worker waiting %.2f ms\n", G, T, (long long) pmax, v.name, tot / 16, mn, (hy_cpu_ms - cpu0) / 17,
+                         (hy_wait_ms - wait0) / 17);
+        }
+        split_snap(gr, G, false);
+        CK(cudaMemcpy(logits, keep_lg.data(), keep_lg.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(pick, keep_pk.data(), keep_pk.size() * 4, cudaMemcpyHostToDevice));
+    }
+    void split_check_run(const Group* gr, int G, int T, int64_t pmax) {
+        const size_t V = (size_t) m->g.n_vocab;
+        auto grab = [&](std::vector<float>& lg, std::vector<int32_t>& pk) {
+            CK(cudaStreamSynchronize(st));
+            lg.resize((size_t) T * V);
+            pk.resize((size_t) T);
+            CK(cudaMemcpy(lg.data(), logits, lg.size() * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(pk.data(), pick, pk.size() * 4, cudaMemcpyDeviceToHost));
+        };
+        std::vector<float> la, la2, lb, lc;
+        std::vector<int32_t> pa, pa2, pb_, pc;
+        grab(la, pa);
+        const int key = G * 10 + (T - G);
+        split_snap(gr, G, false);
+        run_graph_key(split_key() + key, [&] { forward(T, pmax, T, use_graph, false); });
+        grab(la2, pa2);
+        split_snap(gr, G, false);
+        split_serial = true;
+        run_graph_key(split_key() + key, [&] { forward(T, pmax, T, use_graph, false); });
+        split_serial = false;
+        grab(lb, pb_);
+        split_snap(gr, G, false);
+        const int np = split_np;
+        split_np = 0;
+        run_graph_key(key, [&] { forward(T, pmax, T, use_graph, false); });
+        split_np = np;
+        grab(lc, pc);
+        auto cmp = [&](const std::vector<float>& a, const std::vector<float>& b, int& rows_eq) {
+            double md = 0;
+            rows_eq = 0;
+            for (int r = 0; r < T; ++r) {
+                bool eq = std::memcmp(a.data() + (size_t) r * V, b.data() + (size_t) r * V, V * 4) == 0;
+                rows_eq += eq;
+                for (size_t i = 0; i < V; ++i) md = std::max(md, (double) std::fabs(a[(size_t) r * V + i] - b[(size_t) r * V + i]));
+            }
+            return md;
+        };
+        int e_a2, e_b, e_c;
+        const double d_a2 = cmp(la, la2, e_a2), d_b = cmp(la, lb, e_b), d_c = cmp(la, lc, e_c);
+        int pk_c = 0, pk_b = 0;
+        for (int r = 0; r < T; ++r) pk_c += pa[(size_t) r] == pc[(size_t) r], pk_b += pa[(size_t) r] == pb_[(size_t) r];
+        std::fprintf(stderr, "strata-q36 split check %d: %d parts, G %d T %d at %lld: A2 rows bitwise %d/%d (max |d| %.3g), B serial %d/%d "
+                     "(%.3g, picks %d/%d), C unsplit %d/%d (%.3g, picks %d/%d)\n", split_chk_i - 1, split_np, G, T, (long long) pmax,
+                     e_a2, T, d_a2, e_b, T, d_b, pk_b, T, e_c, T, d_c, pk_c, T);
+    }
+    /// ROWS-SPLIT: this window's parts (split_parts(), at most G) from run_rows's staging (hrow), their first rows relative
+    /// to the part uploaded to d_grow0b
+    void split_plan(int G, int T) {
+        split_np = std::min(split_parts(), G);
+        for (int i = 0; i <= split_np; ++i) {
+            split_gb[i] = G * i / split_np;
+            split_rb[i] = split_gb[i] < G ? hrow[48 + split_gb[i]] : T;
+        }
+        for (int i = 0; i < split_np; ++i)
+            for (int g = split_gb[i]; g < split_gb[i + 1]; ++g) hrow[64 + g] = hrow[48 + g] - split_rb[i];
+        CK(cudaMemcpyAsync(d_grow0b, hrow + 64, (size_t) G * 4, cudaMemcpyHostToDevice, st));
+    }
+    /// the graph key's split part: 5000 + 100 * parts (+ 1000 for the serial check order, + 3000 for one stream, + 20000
+    /// without the CPU experts)
+    int split_key() const {
+        return 5000 + 100 * split_np + (split_serial ? 1000 : 0) + (split_streams() == 1 ? 3000 : 0) + (bench_nocpu ? 20000 : 0);
     }
     /// One window for the next token of each of the rows' sessions (no proposals): the greedy picks in rows_pick.
     void step_rows(const Row* rows, int nb) {
@@ -8550,7 +8989,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 768 << 20;
+    // STRATA_Q36_VRAM_RESERVE_MIB (default 768): VRAM left free below the expert slots (CUDA's own allocations, graphs)
+    static const size_t reserve_mib = [] { const char* v = std::getenv("STRATA_Q36_VRAM_RESERVE_MIB"); return v ? (size_t) std::max(128, std::atoi(v)) : (size_t) 768; }();
+    const size_t reserve = reserve_mib << 20;
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                         : (fr > reserve ? fr - reserve : 0);
     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
@@ -8892,7 +9333,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
     if (const char* hv = std::getenv("STRATA_Q36_HANDOFF"); hv && hv[0] == '1') {   // see Engine::ho
-        const size_t ns = all.size(), R = (size_t) Engine::kHoRows;
+        const size_t ns = all.size() * (Engine::rows_split() ? Engine::kParts : 1), R = (size_t) Engine::kHoRows;   // (ROWS_SPLIT: the parts' slots after)
+        E.ho_ns = all.size();
         E.ho_ids.assign(ns, nullptr);
         E.ho_h.assign(ns, nullptr);
         E.ho_ids_d.assign(ns, nullptr);
@@ -9137,6 +9579,12 @@ void w0c_row(W0cStat& S, int r, const std::vector<float>& lg_main, const std::ve
     S.same[r] += d_pen == draft;
     S.bad[r] += d_raw != draft;
 }
+
+static bool batch_topk() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_Q36_BATCH_TOPK"); return v && v[0] == '1'; }();
+    return on;
+}
+bool sample_gpu(Engine& E, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng, int& pick, int row);
 
 /// TD1 (STRATA_Q36_GPU_TOPK=1): sample() from the GPU's candidates: the raw top kk + P logits and the P penalized
 /// history tokens' logits. The penalties only lower a logit here (repeat >= 1, freq >= 0, present >= 0), so the penalized
@@ -9406,8 +9854,12 @@ struct Serve {
             const int n = gr[(size_t) i].n, r0 = row0[(size_t) i];
             int y0 = E.rows_pick[r0];
             if (sl.smp.needs_logits()) {
-                E.host_logits_row(r0, lg);
-                y0 = sample(lg, sl.smp, sl.hist, sl.rng);
+                int pk = -1;   // B-TOPK (STRATA_Q36_BATCH_TOPK=1): the row's draw from the GPU's candidates (TD1's contract)
+                if (batch_topk() && sample_gpu(E, sl.smp, sl.hist, sl.rng, pk, r0)) y0 = pk;
+                else {
+                    E.host_logits_row(r0, lg);
+                    y0 = sample(lg, sl.smp, sl.hist, sl.rng);
+                }
             }
             bool two = n == 2 && y0 == sl.draft && !is_eos(y0) && !sl.stop && sl.produced + 2 <= sl.max_new &&
                        ss.pos + 3 <= E.ctx;   // (ss.pos: the position of the slot's next token: the window did not move it)
@@ -9512,8 +9964,12 @@ struct Serve {
             ss.live.push_back(sl.x);
             int y;
             if (sl.smp.needs_logits()) {
-                E.host_logits_row((int) r, lg);
-                y = sample(lg, sl.smp, sl.hist, sl.rng);
+                int pk = -1;
+                if (batch_topk() && sample_gpu(E, sl.smp, sl.hist, sl.rng, pk, (int) r)) y = pk;
+                else {
+                    E.host_logits_row((int) r, lg);
+                    y = sample(lg, sl.smp, sl.hist, sl.rng);
+                }
             } else {
                 y = E.rows_pick[r];
             }
