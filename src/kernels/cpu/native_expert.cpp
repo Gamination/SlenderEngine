@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,10 +27,39 @@
 #include <string>
 #include <vector>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 namespace strata::kernels::cpu {
 namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
+
+// WP1, STRATA_KQ_PREFETCH=<rows ahead> (opt-in, default 0 = off): the ggml vec_dot row loops below (gate/up and down)
+// prefetch every 64-byte line of the row K ahead, inside the caller's row range [r0, r1).  Only prefetch hints are
+// added: the same vec_dot calls in the same order, so the output bits do not change.  Rows are ~0.35-1.2 KB and not
+// line-aligned, so the hardware prefetchers restart at each 4 KB page.
+int kq_prefetch_rows() {
+    static const int k = [] {
+        const char* v = std::getenv("STRATA_KQ_PREFETCH");
+        const int x = v != nullptr ? std::atoi(v) : 0;
+        return x > 0 ? x : 0;
+    }();
+    return k;
+}
+
+inline void prefetch_row(const uint8_t* p, size_t bytes) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (bytes == 0) return;
+    const uintptr_t first = (uintptr_t) p & ~(uintptr_t) 63;
+    const uintptr_t last = ((uintptr_t) p + bytes - 1) & ~(uintptr_t) 63;
+    for (uintptr_t a = first; a <= last; a += 64) _mm_prefetch((const char*) a, _MM_HINT_T0);
+#else
+    (void) p;
+    (void) bytes;
+#endif
+}
 
 // Do the trellis rows take Strata's own kernels (tq_cpu.hpp)?  Always, unless STRATA_NO_TQ_KERNELS=1 asks for ggml-cpu's
 // vec_dot AND this ggml has the type (the agentionai fork; an upstream ggml does not, and must never be asked about it).
@@ -499,9 +529,14 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         return;
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
+    const int pf = kq_prefetch_rows();   // WP1, 0 = off
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+        if (pf > 0 && r + pf < r1) {   // gate and up are separate streams: prefetch both rows K ahead
+            prefetch_row(gr + (size_t) pf * f.gu_row, f.gu_row);
+            prefetch_row(ur + (size_t) pf * f.gu_row, f.gu_row);
+        }
         for (int t = 0; t < nt; ++t) {
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
@@ -565,8 +600,10 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
+    const int pf = kq_prefetch_rows();   // WP1, 0 = off
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
+        if (pf > 0 && r + pf < r1) prefetch_row(dr + (size_t) pf * f.d_row, f.d_row);
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);

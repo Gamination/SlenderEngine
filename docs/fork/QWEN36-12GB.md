@@ -68,6 +68,10 @@ set STRATA_Q36_SPEC_TOPK=1
 set STRATA_Q36_COMMIT_GRAPH=1
 set STRATA_Q36_MTP_GRAPH=1
 set STRATA_Q36_DRAFT_VOCAB=131072
+rem the CPU experts and the MTP prompt pass
+set STRATA_Q36_HO_FAST=1
+set STRATA_KQ_PREFETCH=2
+set STRATA_Q36_MTP_KVONLY=1
 rem prompts
 set STRATA_Q36_LM=1
 set STRATA_Q36_LM_TAIL=1
@@ -218,6 +222,19 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   step, 67-69% of drafts accepted either way; 65536 and 32768 lose acceptance (65% and 61%).
 - All four: a step 22.2 → 19.5 ms with the timers on. With the first three, six seeded answers and a 50K prompt with
   its follow-up gave the same text and the same accepted drafts as without them.
+
+**CPU experts and the MTP prompt pass** (measured 2026-11-15, `--mtp 2`, one run each with a fixed seed; in the configuration
+above and the fast setup)
+- `STRATA_Q36_HO_FAST=1`: the CPU expert handoff without per-call allocations, the graph's CPU jobs queued before the
+  graph launches, a pause instruction in the routing-flag spin. Short answers 120.3 → 128.0 tok/s, the same text.
+- `STRATA_KQ_PREFETCH=2`: the CPU expert rows prefetch the row two ahead (gate, up and down rows); the same arithmetic.
+  120.3 → 129.7, the same text; with `HO_FAST` **134.1**. A distance of 4 gave 129.4.
+- `STRATA_Q36_MTP_KVONLY=1`: the MTP block's pass over a prompt writes only its K/V cells (the same kernels), with no
+  attention, experts or expert stream for prompt rows. A 50K read 4,318 → 4,527 tok/s, the same text.
+- Opt-in, not in the configuration: `STRATA_Q36_SLOT_FIX=1` (the slot budget no longer subtracts the prompt-chunk
+  buffers twice: 62 → 67 expert slots a layer, 133.4 alone but not on top of the two above in two runs, and the text
+  changes because more experts run on the GPU's kernels); `STRATA_Q36_DRAFT_PMIN=<p>` (stop drafting after a draft whose
+  top probability is under p: at 0.3 it skipped under 2% of drafts for 123.1 and moved the text).
 
 **Diagnostics and measured-but-not-used**
 - `STRATA_Q36_PROF=1/2/3`: prompt stage times, exact per-stage times, decode stage times. `STRATA_POOL_PHASE_TIMING=1`:
