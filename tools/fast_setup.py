@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""Tunes an installed Qwen3.8-Flash-Next IQ3_S for a 32 GB PC on Windows and, if you want, sets up dual SSD streaming.
+"""One-step setup of Qwen3.8-Flash-Next GSQ-RCO IQ3_S on a 32 GB Windows PC with an NVIDIA card. FAST-SETUP.bat runs this.
 
-It reads the config setup wrote, and writes its own config and launcher beside it (strata-fast.json, run-fast.bat).
-Setup's files are not changed. Nothing is written with --dry-run. FAST-SETUP.bat runs this.
+The first run asks where the model files are (they are never downloaded here), builds the engine with setup.py, then tunes
+for a 32 GB PC and offers dual SSD streaming. Later runs only tune. It writes strata-fast.json and run-fast.bat beside
+setup's own config; the tuning does not change setup's files. Nothing is written with --dry-run.
 
+  PATH                the model files: the folder with the two .gguf files, or one of them (dragging the folder onto
+                      FAST-SETUP.bat passes it here). Given again later, it sets the model up again from that folder
+  --drafter-dir PATH  the DFlash2 drafter you have (config.json + model.safetensors, or its .pack). Without it the
+                      first run asks; Enter downloads the MTP draft layer (about 5 GB) instead
+  --rebuild           build the engine again from this folder's code, with the model folder setup used before
+  --fast-prompts      the opt-in prompt switches (fused prompt experts, tensor-core GDN scan, larger chunks): faster
+                      long prompts, results changed at rounding level (docs/fork/PERFORMANCE.md)
   --dry-run           show what would happen and stop
   --yes               no questions: the settings, and the best second drive unless --no-mirror
   --ram-gib N         GiB of RAM for the experts, without asking (default on a 32 GB PC: 10)
   --skip N            the expert skip, without asking: 0 (the default, every expert computed) or 7 (faster, answers change)
-  --mirror-dir PATH  the folder for the copy of experts.bin (it must be on another physical drive)
+  --mirror-dir PATH   the folder for the copy of experts.bin (it must be on another physical drive)
   --no-mirror         one drive only
   --verify            compare an existing copy with the original by hash, too
   --config PATH       the config to start from (default strata-iq3_s.json, else strata-iq3_xxs.json)
@@ -19,6 +27,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -30,7 +39,19 @@ HOME = Path(__file__).resolve().parent.parent
 GIB = 1024 ** 3
 MIRROR_SPARE = 5 * GIB
 PATCHED_MARK = b"STRATA_FORK_DEFAULTS"   # only this fork's engine holds this name, from the build that applies its defaults itself
-SETUP_ARGS = "--family qwen --model IQ3_S --build --context 262144 --kv int8 --vision gpu --no-start"
+
+# The model files this setup tunes (ISTA-DASLab's GSQ-RCO quants), with the sizes setup.py pins (ISTA_FILES), so a download
+# that did not finish is caught here, before a build. IQ3_S is the one measured; IQ3_XXS is the smaller one the tuning also reads.
+MODEL_PAGE = "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_S"
+MODEL_RE = re.compile(r"^Qwen3\.8-Flash-Next-GSQ-RCO-(IQ3_S|IQ3_XXS)-(\d{5})-of-(\d{5})\.gguf$", re.I)
+MODEL_SIZES = {
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf": 54817524224,
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf": 28800138432,
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf": 47039860096,
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf": 28800138432,
+}
+MMPROJ = ("mmproj-Qwen3.8-Flash-Next-BF16.gguf", 907543008)      # the picture encoder, in the same repository's top folder
+DRAFTER_PAGE = "https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2"
 
 
 def say(text=""):
@@ -220,12 +241,12 @@ def choose_mirror(a, src, vols):
     else:
         found = mirror_candidates(vols, pack_letter, size + MIRROR_SPARE)
         if not found:
-            say(f"Dual SSD: no other SSD has {(size + MIRROR_SPARE) / GIB:.0f} GB free, so this stays on one drive. The other settings still apply.")
+            say(f"Dual SSD: no other SSD has {(size + MIRROR_SPARE) / GIB:.0f} GiB free, so this stays on one drive. The other settings still apply.")
             return None
-        say(f"Dual SSD: a copy of experts.bin ({size / GIB:.1f} GB) on a second SSD lets each read come from both drives.")
+        say(f"Dual SSD: a copy of experts.bin ({size / GIB:.1f} GiB) on a second SSD lets each read come from both drives.")
         say("  Measured on two 990 PRO: +12% text, +39% prompt reading. Reading does not wear an SSD; the copy writes the file once.")
         for i, v in enumerate(found, 1):
-            say(f"  {i}. {v['letter']}: {v['name']}, {v['free'] / GIB:.0f} GB free")
+            say(f"  {i}. {v['letter']}: {v['name']}, {v['free'] / GIB:.0f} GiB free")
         if a.yes:
             pick = max(found, key=lambda v: (v["bus"] == "NVMe", v["free"]))
         else:
@@ -269,7 +290,7 @@ def choose_ram(a, ram):
         pick = default
     else:
         say("How much RAM should hold the model's experts? More is faster, but leaves less for other apps.")
-        say("  Measured on 32 GB: 10 GiB gave 48 tok/s with at least 3.3 GiB free; 14 GiB gave 52 tok/s with 0.7 GiB free and more writes to the page file.")
+        say("  Measured on 32 GB (2026-11-05, expert skipping on): 14 GiB was faster than 10 GiB, but left under 1 GiB free and wrote up to 36 GB an hour to the page file; 10 GiB wrote none.")
         say("  The engine uses about 8 GiB more on top of this. Other amounts have not been measured on their own.")
         while True:
             ans = input(f"GiB of RAM, 1-{top}, or Enter for {default}: ").strip()
@@ -324,10 +345,248 @@ def launcher(cfg_path, env):
     return "\r\n".join(lines)
 
 
+def clean_path(text):
+    text = (text or "").strip().strip('"').strip("'").strip()
+    return Path(text).expanduser() if text else None
+
+
+def find_model(path):
+    """(folder, size name, shard paths) for the model files at `path`: one of the files, the folder with them, or the folder
+    above it (the repository's own layout, IQ3_S\\ inside). Else a plain-words reason they cannot be used."""
+    if path is None or not path.exists():
+        return f"{path} was not found."
+    if path.is_file():
+        if not MODEL_RE.match(path.name):
+            return (f"{path.name} is not one of the model files. They are named like "
+                    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf.")
+        firsts = [path.with_name(re.sub(r"-\d{5}-of-", "-00001-of-", path.name, count=1))]
+    else:
+        firsts = []
+        for folder in (path, path / "IQ3_S", path / "IQ3_XXS"):
+            try:
+                firsts += sorted(f for f in folder.glob("*-00001-of-*.gguf") if MODEL_RE.match(f.name))
+            except OSError:
+                pass
+        if not firsts:
+            return (f"No model files in {path}. It needs the two Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000N-of-00002.gguf "
+                    f"files from {MODEL_PAGE}")
+        firsts.sort(key=lambda f: MODEL_RE.match(f.name).group(1).upper() != "IQ3_S")      # IQ3_S first when both are there
+    first = firsts[0]
+    m = MODEL_RE.match(first.name)
+    size, total = m.group(1).upper(), int(m.group(3))
+    shards = [first.with_name(re.sub(r"-00001-of-", "-%05d-of-" % i, first.name, count=1)) for i in range(1, total + 1)]
+    for sh in shards:
+        if not sh.is_file():
+            return f"{sh.name} is missing from {first.parent}. Both files are needed."
+        want, have = MODEL_SIZES.get(sh.name), sh.stat().st_size
+        if want and have != want:
+            return (f"{sh.name} is {have / 1e9:.1f} GB, but the published file is {want / 1e9:.1f} GB: the download did not "
+                    "finish, or the file was changed. Download it again, then run this again.")
+    return first.parent, size, shards
+
+
+def find_mmproj(folder):
+    """The picture encoder beside the model files, or in the folder above them (where the repository keeps it), or None.
+    Outside the model's own folder only a file of the full size counts (a half-copied one is not used)."""
+    name, size = MMPROJ
+    for f in (folder / name, folder.parent / name, folder.parent / "models" / name):
+        try:
+            if f.is_file() and (f.parent == folder or f.stat().st_size == size):
+                return f
+        except OSError:
+            continue
+    return None
+
+
+def drafting_modules():
+    if str(HOME) not in sys.path:
+        sys.path.insert(0, str(HOME))
+    from strata_control import drafting, drafting_fetch
+    return drafting, drafting_fetch
+
+
+def find_drafter(path):
+    """("src", folder) for the drafter's original files, ("pack", file) for its Q4_0 pack, or a plain-words reason. Every
+    file is checked against the size and SHA-256 Strata pins, so nothing later fetches a replacement."""
+    drafting, _ = drafting_modules()
+    if path is None or not path.exists():
+        return f"{path} was not found."
+    pack = (path if path.is_file() else path / drafting.PACK_NAME)
+    if pack.name == drafting.PACK_NAME and pack.is_file():
+        if pack.stat().st_size != drafting.PACK_BYTES or drafting.sha256_of(pack) != drafting.PACK_SHA256:
+            return f"{pack.name} is not the expected file (its size or checksum differs)."
+        return "pack", pack
+    folder = path if path.is_dir() else path.parent
+    missing = [n for n, _s, _h in drafting.FILES if not (folder / n).is_file()]
+    if missing:
+        return (f"{folder} has no {' or '.join(missing)}. The drafter is the config.json and model.safetensors files "
+                f"from {DRAFTER_PAGE}")
+    say("  Checking the drafter files ...")
+    for name, size, sha in drafting.FILES:
+        f = folder / name
+        if f.stat().st_size != size or drafting.sha256_of(f) != sha:
+            return f"{name} is not the expected file (its size or checksum differs): download it again from {DRAFTER_PAGE}"
+    return "src", folder
+
+
+def drafter_in_hf_cache():
+    """The drafter's pinned files where the Hugging Face tools keep them, already checked; else None."""
+    try:
+        drafting, drafting_fetch = drafting_modules()
+        have = drafting_fetch._present(drafting_fetch._hub_snapshots(), drafting.FILES)
+        if len(have) == len(drafting.FILES):
+            return have["model.safetensors"].parent
+    except Exception:          # noqa: BLE001 - only a shortcut: without it the person is asked
+        pass
+    return None
+
+
+def ask_path(question, check, allow_empty):
+    while True:
+        try:
+            ans = clean_path(input(question))
+        except EOFError:
+            ans = None
+        if ans is None:
+            if allow_empty:
+                return None
+            say("  A path is needed. Close this window to stop.")
+            continue
+        got = check(ans)
+        if isinstance(got, str):
+            say("  " + got)
+            continue
+        return got
+
+
+def link_or_copy(src, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copyfile(src, dst)
+
+
+def install_drafter(drafter, data_dir):
+    """Put the drafter the person pointed to under the data folder and pack it there (no network: every file was checked first)."""
+    drafting, drafting_fetch = drafting_modules()
+    kind, where = drafter
+    folder = data_dir / drafting.FOLDER
+    if kind == "pack":
+        link_or_copy(where, folder / where.name)
+    else:
+        for name, _size, _sha in drafting.FILES:
+            link_or_copy(where / name, folder / "src" / name)     # packing removes these links or copies, never the originals
+    say("Preparing the DFlash2 drafter ...")
+    drafting_fetch.ensure(data_dir)
+    say("  DFlash2 drafter ready.")
+
+
+def config_path(a):
+    return Path(a.config) if a.config else next((p for p in (HOME / "strata-iq3_s.json", HOME / "strata-iq3_xxs.json") if p.exists()), None)
+
+
+def model_folder_of(cfg_file):
+    """The model folder setup used before (the --native shard in its config), or None."""
+    try:
+        args = json.loads(Path(cfg_file).read_text(encoding="utf-8")).get("args") or []
+        return Path(args[args.index("--native") + 1]).parent
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+
+
+def first_run(a):
+    """Ask for the model (and the drafter), then build with setup.py. Returns the drafter to install after the build, or
+    "dry" on a dry run."""
+    say()
+    say(" SlenderEngine setup: Qwen3.8-Flash-Next GSQ-RCO IQ3_S")
+    say()
+    say(" You need the model's two .gguf files (84 GB), downloaded yourself from")
+    say(f"   {MODEL_PAGE}")
+    say(f" Optional, beside them or in the folder above: {MMPROJ[0]} (0.9 GB, for pictures).")
+    say(f" Optional: the DFlash2 drafter (1.2 GB) from {DRAFTER_PAGE}")
+    say()
+    if a.path:
+        got = find_model(clean_path(a.path))
+        if isinstance(got, str):
+            sys.exit(got)
+    elif a.yes:
+        sys.exit('--yes needs the model folder too, as in: FAST-SETUP.bat "D:\\Models\\IQ3_S" --yes')
+    else:
+        got = ask_path("Where are the model files? Paste or drag their folder into this window, then press Enter:\n  > ",
+                       find_model, False)
+    folder, size, _shards = got
+    say(f"  Model: {size} in {folder}")
+    mmproj = find_mmproj(folder)
+    say(f"  Pictures: on ({mmproj})" if mmproj else
+        f"  Pictures: off. To turn them on later, put {MMPROJ[0]} beside the model and run FAST-SETUP.bat --rebuild")
+
+    drafter = None
+    have = installed_drafter(config_path(a))
+    if have and not a.drafter_dir:
+        say(f"  Drafter: {have}, already set up")
+        cmd_drafter = ["--drafter", "dflash2"] if have == "DFlash2" else []
+        return run_setup(a, size, folder, mmproj, cmd_drafter, None)
+    if a.drafter_dir:
+        drafter = find_drafter(clean_path(a.drafter_dir))
+        if isinstance(drafter, str):
+            sys.exit(drafter)
+    elif (cached := drafter_in_hf_cache()) is not None:
+        drafter = ("src", cached)
+    elif not a.yes:
+        say()
+        say(" A drafter guesses a few words ahead, which makes answers about twice as fast.")
+        drafter = ask_path("Where is the DFlash2 drafter? Paste its folder, or press Enter to download the MTP draft layer "
+                           "(about 5 GB) instead:\n  > ", find_drafter, True)
+    say(f"  Drafter: DFlash2 ({drafter[1]})" if drafter else "  Drafter: the MTP draft layer, downloaded during setup (about 5 GB)")
+    return run_setup(a, size, folder, mmproj, ["--drafter", "dflash2"] if drafter else [], drafter)
+
+
+def installed_drafter(cfg_file):
+    """"DFlash2" or "MTP" when the data folder of an earlier install already holds a drafter, else None."""
+    try:
+        args = json.loads(Path(cfg_file).read_text(encoding="utf-8")).get("args") or []
+        data_dir = Path(args[args.index("--pack") + 1]).parent.parent
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+    try:
+        drafting, _ = drafting_modules()
+        if drafting.pack_ready(data_dir):
+            return "DFlash2"
+    except Exception:          # noqa: BLE001
+        pass
+    return "MTP" if (data_dir / "mtp" / "rt" / "experts.bin").is_file() else None
+
+
+def run_setup(a, size, folder, mmproj, drafter_args, drafter):
+    cmd = [sys.executable, str(HOME / "setup.py"), "--family", "qwen", "--model", size, "--build", "--context", "262144",
+           "--kv", "int8", "--vision", "gpu" if mmproj else "none", "--gguf-dir", str(folder),
+           "--experimental-speed-projection", "off", "--yes", "--no-start"] + drafter_args
+    say()
+    say(" Next, setup checks this PC, installs build tools that are missing (Visual Studio 2022 Build Tools, CUDA 13.0;")
+    say(" Windows may ask for permission), builds the engine, and writes a 50 GB experts file into the data folder it")
+    say(" names. This takes a while; keep the window open. Setup may say IQ3_S needs 62 GB of RAM: that is upstream")
+    say(" Strata's figure. This fork runs it on 32 GB by reading experts from the SSD.")
+    if a.dry_run:
+        say("\nDry run: nothing was built. Setup would run as\n  " + subprocess.list2cmdline(cmd))
+        return "dry"
+    say()
+    rc = subprocess.call(cmd, cwd=str(HOME))
+    if rc != 0 or config_path(a) is None:
+        sys.exit("\nSetup did not finish, so nothing was tuned. See the messages above, then run FAST-SETUP.bat again.")
+    return drafter
+
+
 def main():
     if os.name != "nt":
         sys.exit("This setup is for Windows. On Linux, use ./setup.sh and the settings in FORK.md.")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("path", nargs="?")
+    ap.add_argument("--drafter-dir")
+    ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--fast-prompts", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--ram-gib", type=float)
@@ -339,9 +598,18 @@ def main():
     ap.add_argument("--out-dir", default=str(HOME))
     a = ap.parse_args()
 
-    source = Path(a.config) if a.config else next((p for p in (HOME / "strata-iq3_s.json", HOME / "strata-iq3_xxs.json") if p.exists()), None)
-    if source is None or not source.exists():
-        sys.exit(f"No model is installed yet. Run FAST-SETUP.bat, or: START-HERE.bat {SETUP_ARGS}")
+    source = config_path(a)
+    if a.rebuild and not a.path:
+        folder = model_folder_of(source) if source else None
+        if folder is None:
+            sys.exit("Nothing to rebuild yet: run FAST-SETUP.bat with the model folder first.")
+        a.path = str(folder)
+    drafter = None
+    if a.path or source is None or not source.exists():
+        drafter = first_run(a)
+        if drafter == "dry":
+            return 0
+        source = config_path(a)
     cfg = json.loads(source.read_text(encoding="utf-8"))
     args = cfg.get("args") or []
     if "--pack" not in args:
@@ -349,9 +617,9 @@ def main():
 
     exe = Path(cfg.get("exe") or "")
     if not exe.exists():
-        sys.exit(f"The engine {exe} is missing. Run: START-HERE.bat {SETUP_ARGS}")
+        sys.exit(f"The engine {exe} is missing. Build it with: FAST-SETUP.bat --rebuild")
     if PATCHED_MARK not in exe.read_bytes():
-        sys.exit(f"{exe} is a stock engine, or this fork's from before it applied its own defaults. Build this one with: START-HERE.bat {SETUP_ARGS}")
+        sys.exit(f"{exe} is a stock engine, or this fork's from before it applied its own defaults. Build this one with: FAST-SETUP.bat --rebuild")
 
     src = Path(args[args.index("--pack") + 1]) / "experts.bin"
     if not src.exists():
@@ -391,9 +659,17 @@ def main():
             env["STRATA_COLD_READER_CPUS"] = ",".join(map(str, cpu["readers"]))
     if mirror is not None:
         env["STRATA_EXPERTS_MIRROR"] = str(mirror)
+    if a.fast_prompts:
+        # Opt-in prompt switches, rounding-level changes (docs/fork/PERFORMANCE.md): fused prompt experts, the tensor-core GDN scan,
+        # and chunks of up to 16,896 tokens (the two byte-identical memory changes that make room for them, then the larger chunks)
+        env.update({"STRATA_PF_FUSED": "1", "STRATA_GDN_TC": "1", "STRATA_PF_HC_REGION": "1", "STRATA_EMB_REUSE_ACCOUNT": "1",
+                    "STRATA_PREFILL_AUTO_MAX": "32768", "STRATA_PREFILL_RING": "256"})
+        set_arg(args, "--prefill", "auto:32768")
     # DFlash2 drafts instead of the MTP layer when its drafter is on disk (Strata-data\dflash2\*.pack): on the PC this was tuned on, follow-ups
     # +5% and 50K prompt reading +11%, thinking-on short answers level (FORK.md). The server then sets --draft dflash2 --spec 6 --draft-conf 0.8.
     data_dir = Path(args[args.index("--pack") + 1]).parent.parent
+    if drafter and not a.dry_run:
+        install_drafter(drafter, data_dir)
     df2_packs = sorted((data_dir / "dflash2").glob("*.pack"))
     if df2_packs:
         cfg["drafting"] = "dflash2"

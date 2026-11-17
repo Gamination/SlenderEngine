@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Tunes an installed Qwen3.6-35B-A3B (setup's --family qwen36) with the switches this fork measured, for this PC's card,
-RAM and CPU. FAST-SETUP-35B.bat runs it after setup's install.
+"""One-step setup of Qwen3.6-35B-A3B UD-Q4_K_M (setup's --family qwen36) with the switches this fork measured, for this
+PC's card, RAM and CPU. FAST-SETUP-35B.bat runs it.
+
+The first run asks where the model file is (it is never downloaded here; a copy in the Hugging Face cache is used without
+asking), builds the engine with setup.py, then tunes. Later runs only tune.
+
+  PATH               the model file Qwen3.6-35B-A3B-UD-Q4_K_M.gguf, or its folder (dragging it onto FAST-SETUP-35B.bat
+                     passes it here). Given again later, it sets the model up again from there
+  --rebuild          build the engine again from this folder's code, with the model file setup used before
+  --yes              no questions (needs PATH, or the file in the Hugging Face cache)
 
 It reads the config setup wrote (strata-qwen36-ud-q4_k_m.json by default) and writes its own config and launcher beside it
 (strata-qwen36-fast.json, run-qwen36-fast.bat). Setup's files are not changed. Nothing is written with --dry-run.
@@ -174,14 +182,130 @@ def launcher(cfg_path, env, title):
     return "\r\n".join(lines) + "\r\n"
 
 
+MODEL_NAME = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+MODEL_BYTES = 22663387424          # the MTP repository's file, as setup.py pins it (QWEN36_FILES); the plain repository's file differs
+MODEL_PAGE = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
+MMPROJ = "mmproj-F16.gguf"         # the picture encoder, in the same repository; setup takes it only from the model's own folder
+
+
+def clean_path(text):
+    text = (text or "").strip().strip('"').strip("'").strip()
+    return Path(text).expanduser() if text else None
+
+
+def find_model(path):
+    """The model file at `path` (the file, or a folder holding it), or a plain-words reason it cannot be used."""
+    if path is None or not path.exists():
+        return f"{path} was not found."
+    f = path if path.is_file() else path / MODEL_NAME
+    if f.name != MODEL_NAME:
+        return f"{f.name} is not the model file. It is named {MODEL_NAME}, from {MODEL_PAGE}"
+    if not f.is_file():
+        others = sorted(p.name for p in path.glob("Qwen3.6-35B-A3B-*.gguf")) if path.is_dir() else []
+        return (f"{MODEL_NAME} is not in {path}" + (f" (it has {', '.join(others)}; this setup is tuned for UD-Q4_K_M)" if others else "")
+                + f". Download it from {MODEL_PAGE}")
+    have = f.stat().st_size
+    if have != MODEL_BYTES:
+        return (f"{f.name} is {have / 1e9:.2f} GB, but the file with the MTP block is {MODEL_BYTES / 1e9:.2f} GB: the download did not "
+                f"finish, or it is the file from the repository without the MTP block. Download it from {MODEL_PAGE}")
+    return f
+
+
+def model_in_hf_cache():
+    """The model file in the Hugging Face cache (any snapshot), at its pinned size; else None."""
+    roots = [Path(os.environ[n]) for n in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE") if os.environ.get(n)]
+    if os.environ.get("HF_HOME"):
+        roots.append(Path(os.environ["HF_HOME"]) / "hub")
+    roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+    for r in roots:
+        for f in sorted((r / "models--unsloth--Qwen3.6-35B-A3B-MTP-GGUF" / "snapshots").glob("*/" + MODEL_NAME)):
+            try:
+                if f.stat().st_size == MODEL_BYTES:
+                    return f
+            except OSError:
+                continue
+    return None
+
+
+def model_file_of(cfg_file):
+    """The model file setup used before (the argument in its config that names it), or None."""
+    try:
+        args = json.loads(Path(cfg_file).read_text(encoding="utf-8")).get("args") or []
+    except (OSError, ValueError):
+        return None
+    return next((Path(x) for x in args if isinstance(x, str) and x.endswith(MODEL_NAME)), None)
+
+
+def first_run(a):
+    """Find the model (asking when needed), then build with setup.py. Returns True when setup ran (False on a dry run)."""
+    say()
+    say(" SlenderEngine setup: Qwen3.6-35B-A3B UD-Q4_K_M")
+    say()
+    say(f" You need the model file {MODEL_NAME} (22.7 GB), downloaded yourself from")
+    say(f"   {MODEL_PAGE}")
+    say(f" Optional, in the same folder: {MMPROJ} (0.9 GB, for pictures).")
+    say()
+    if a.path:
+        got = find_model(clean_path(a.path))
+        if isinstance(got, str):
+            sys.exit(got)
+    elif (got := model_in_hf_cache()) is not None:
+        say(f"  Found in the Hugging Face cache; used where it is.")
+    elif a.yes:
+        sys.exit(f'--yes needs the model file too, as in: FAST-SETUP-35B.bat "D:\\Models\\{MODEL_NAME}" --yes')
+    else:
+        while True:
+            try:
+                ans = clean_path(input("Where is the model file? Paste or drag it (or its folder) into this window, then press Enter:\n  > "))
+            except EOFError:
+                ans = None
+            if ans is None:
+                say("  A path is needed. Close this window to stop.")
+                continue
+            got = find_model(ans)
+            if not isinstance(got, str):
+                break
+            say("  " + got)
+    folder = got.parent
+    pictures = (folder / MMPROJ).is_file()
+    say(f"  Model: {got}")
+    say(f"  Pictures: on ({folder / MMPROJ})" if pictures else
+        f"  Pictures: off. To turn them on later, put {MMPROJ} beside the model and run FAST-SETUP-35B.bat --rebuild")
+    cmd = [sys.executable, str(HOME / "setup.py"), "--family", "qwen36", "--model", "UD-Q4_K_M", "--build", "--context", "262144",
+           "--gguf-dir", str(folder), "--vision", "yes" if pictures else "no", "--yes", "--no-start"]
+    say()
+    say(" Next, setup checks this PC, installs build tools that are missing (Visual Studio 2022 Build Tools, CUDA 13.0;")
+    say(" Windows may ask for permission) and builds the engine for your card. Keep the window open. On its first start the")
+    say(" engine writes a 20 GB expert cache file next to the model, so that drive needs the room.")
+    if a.dry_run:
+        say("\nDry run: nothing was built. Setup would run as\n  " + subprocess.list2cmdline(cmd))
+        return False
+    say()
+    rc = subprocess.call(cmd, cwd=str(HOME))
+    if rc != 0 or not Path(a.config).is_file():
+        sys.exit("\nSetup did not finish, so nothing was tuned. See the messages above, then run FAST-SETUP-35B.bat again.")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("path", nargs="?")
+    ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--yes", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--config", default=str(HOME / "strata-qwen36-ud-q4_k_m.json"))
     ap.add_argument("--out-dir", default=str(HOME))
     ap.add_argument("--context", type=int)
     ap.add_argument("--simulate")
     a = ap.parse_args()
+    if a.rebuild and not a.path:
+        f = model_file_of(a.config)
+        if f is None:
+            sys.exit("Nothing to rebuild yet: run FAST-SETUP-35B.bat with the model file first.")
+        a.path = str(f)
+    if not a.simulate and (a.path or not Path(a.config).is_file()):
+        if not first_run(a):
+            return 0
     if a.simulate:
         sim = dict(kv.split("=", 1) for kv in a.simulate.split(","))
         gpu, vram, cc = sim.get("gpu", "simulated"), float(sim.get("vram", 12)), float(sim.get("cc", 8.9))

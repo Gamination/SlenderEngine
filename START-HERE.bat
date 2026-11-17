@@ -45,11 +45,14 @@ exit /b 1
 set "PYTHONNOUSERSITE=1"
 set "PYTHONHOME="
 set "PYTHONPATH="
+if "%~1"=="--python-only" exit /b 0
 "python\python.exe" setup.py %*
 if errorlevel 1 pause
 exit /b
 
 :run
+rem --python-only (FAST-SETUP.bat): Python and .venv are ready; stop before setup
+if "%~1"=="--python-only" exit /b 0
 ".venv\Scripts\python.exe" setup.py %*
 if errorlevel 1 pause
 exit /b
