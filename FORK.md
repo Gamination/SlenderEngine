@@ -108,7 +108,7 @@ The dual SSD copy must be the same file as the pack's `experts.bin`. The engine 
 |---|---|
 | Experts cached in RAM | **10 GiB**, or what you choose |
 | Saved conversation checkpoints in RAM | **Off** |
-| Drafting | DFlash2 (`"drafting": "dflash2"`, the server sets `--draft dflash2 --spec 6 --draft-conf 0.8`) when its drafter is in `Strata-data\dflash2`, else the MTP layer with `--spec 4 --spec-min-p 0.5`. The DFlash2 drafter is CC BY-NC-ND |
+| Drafting | DFlash2 (`"drafting": "dflash2"`, the server sets `--draft dflash2 --spec 6 --draft-conf 0.8`) when its drafter is in `Strata-data\dflash2`, else the MTP layer with `--spec 4 --spec-min-p 0.5`. The DFlash2 drafter is Apache-2.0 (its model page, checked 2026-11-15) |
 | CPU workers | One per P-core, leaving the first for the host (7 here) |
 | SSDs | Two if you pick a second drive |
 | Read-through | **On at 10 GiB or below** |
