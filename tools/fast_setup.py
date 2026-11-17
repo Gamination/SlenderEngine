@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""One-step setup of Qwen3.8-Flash-Next GSQ-RCO IQ3_S on a 32 GB Windows PC with an NVIDIA card. FAST-SETUP.bat runs this.
+"""One-step setup of Qwen3.8-Flash-Next GSQ-RCO IQ3_S on a 32 GB PC with an NVIDIA card. FAST-SETUP.bat (Windows) and
+fast-setup.sh (Linux) run this.
 
 The first run asks where the model files are (they are never downloaded here), builds the engine with setup.py, then tunes
-for a 32 GB PC and offers dual SSD streaming. Later runs only tune. It writes strata-fast.json and run-fast.bat beside
+for a 32 GB PC and offers dual SSD streaming (Windows only). Later runs only tune. It writes strata-fast.json and
+run-fast.bat (run-fast.sh on Linux) beside
 setup's own config; the tuning does not change setup's files. Nothing is written with --dry-run.
 
   PATH                the model files: the folder with the two .gguf files, or one of them (dragging the folder onto
@@ -28,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -38,6 +41,8 @@ from pathlib import Path
 HOME = Path(__file__).resolve().parent.parent
 GIB = 1024 ** 3
 MIRROR_SPARE = 5 * GIB
+WIN = os.name == "nt"
+SETUP = "FAST-SETUP.bat" if WIN else "./fast-setup.sh"      # what the messages tell the person to run
 PATCHED_MARK = b"STRATA_FORK_DEFAULTS"   # only this fork's engine holds this name, from the build that applies its defaults itself
 
 # The model files this setup tunes (ISTA-DASLab's GSQ-RCO quants), with the sizes setup.py pins (ISTA_FILES), so a download
@@ -59,6 +64,12 @@ def say(text=""):
 
 
 def total_ram_gib():
+    if not WIN:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024 / GIB
+        return 0.0
     class Status(ctypes.Structure):
         _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
                     ("page", ctypes.c_ulonglong), ("avail_page", ctypes.c_ulonglong), ("virt", ctypes.c_ulonglong),
@@ -69,8 +80,42 @@ def total_ram_gib():
     return s.total / GIB
 
 
+def cpu_ids(text):
+    """A Linux CPU list ("0-3,8,10-11") as numbers."""
+    out = []
+    for part in (text or "").strip().split(","):
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            out += range(int(lo), int(hi) + 1)
+        elif part.strip():
+            out.append(int(part))
+    return out
+
+
+def cpu_cores_linux(sysfs="/sys"):
+    """Per physical core: (1 for a P-core of a hybrid Intel CPU, else 0; its logical CPUs), from sysfs. A hybrid CPU lists its
+    P-cores' logical CPUs in /sys/devices/cpu_core/cpus (the E-cores in cpu_atom); other CPUs have no such file."""
+    def read(path):
+        try:
+            return Path(path).read_text()
+        except OSError:
+            return ""
+    p = set(cpu_ids(read(f"{sysfs}/devices/cpu_core/cpus")))
+    root = Path(sysfs) / "devices" / "system" / "cpu"
+    seen, cores = set(), []
+    for n in sorted(int(d.name[3:]) for d in root.glob("cpu[0-9]*") if d.name[3:].isdigit()):
+        if n in seen:
+            continue
+        sib = cpu_ids(read(root / f"cpu{n}" / "topology" / "thread_siblings_list")) or [n]
+        seen.update(sib)
+        cores.append((1 if n in p else 0, sorted(sib)))
+    return cores
+
+
 def cpu_cores():
-    """Per physical core: (efficiency class, its logical processors), in Windows' order."""
+    """Per physical core: (efficiency class, its logical processors), in the system's order."""
+    if not WIN:
+        return cpu_cores_linux()
     k = ctypes.windll.kernel32
     size = ctypes.c_ulong(0)
     k.GetLogicalProcessorInformationEx(0, None, ctypes.byref(size))
@@ -227,6 +272,9 @@ def copy_experts(src, dst):
 
 def choose_mirror(a, src, vols):
     """The path to use, or None for one drive. Copies the file if it is not there yet."""
+    if not WIN:
+        say("Dual SSD: not on Linux (the engine reads a second copy on Windows only). One drive.")
+        return None
     size = src.stat().st_size
     pack_letter = src.drive[:1]
     if a.no_mirror:
@@ -279,7 +327,7 @@ def choose_mirror(a, src, vols):
 
 
 def choose_ram(a, ram):
-    """GiB of RAM for the experts: --ram-gib, else the person's answer, else the default. Above the safe line it warns, because Windows then pages."""
+    """GiB of RAM for the experts: --ram-gib, else the person's answer, else the default. Above the safe line it warns, because the system then pages."""
     measured = 28 <= ram <= 36
     default = 10 if measured else max(4, min(48, round(ram) - 22))
     top = max(1, round(ram) - 8)
@@ -308,7 +356,7 @@ def choose_ram(a, ram):
     if not measured:
         say(f"This fork is tuned for 32 GB. {pick:g} GiB of experts on a {ram:.0f} GB PC has not been measured.")
     if pick > safe:
-        say(f"{pick:g} GiB leaves little free RAM: close other large programs, or Windows will page heavily, which writes to your SSD.")
+        say(f"{pick:g} GiB leaves little free RAM: close other large programs, or the system will page heavily, which writes to your SSD.")
     return pick
 
 
@@ -337,7 +385,35 @@ def set_arg(args, name, value):
         args += [name, value]
 
 
+def launcher_sh(cfg_path, env):
+    py, q = HOME / ".venv" / "bin" / "python", lambda x: shlex.quote(str(x))
+    lines = ["#!/bin/sh", "# Written by fast-setup.sh. Chat page and API: http://127.0.0.1:8080"]
+    lines += [f"export {k}={q(v)}" for k, v in env.items()]
+    lines += ["export PYTHONUTF8=1", f"cd {q(HOME)} || exit 1",
+              f'exec {q(py)} {q(HOME / "serve" / "server.py")} --engine strata --config {q(cfg_path)} --port 8080 --open "$@"', ""]
+    return "\n".join(lines)
+
+
+def linux_fork_env(budget, ram, df2):
+    """Linux: the engine applies only the first row of the fork's defaults (FORK.md, "Defaults": generate.cpp's block is
+    Windows-only), so the launcher sets the rest as the engine sets them on Windows. Not measured on Linux. Left out: the
+    block's prompt loan of 90% (STRATA_PREFILL_LEND_PCT would also override the engine's own 100% on short cards)."""
+    env = {f"STRATA_{n}": "1" for n in ("UNBUFFERED_LOAD", "RAM_ADAPT", "COLD_OVERLAP", "COLD_KEPT_READERS", "PARTIAL_PIN",
+                                        "RAM_ADAPT_PAR", "RAM_ADAPT_BG", "KV_LEND", "DIRECT_BATCH", "STAGER_IN_PLACE",
+                                        "DENSE_ARENA", "HC_UPMIX")}
+    env.update({"STRATA_STAGER_RING": "128", "STRATA_STAGER_THREADS": "3", "STRATA_STAGER_BATCH": "1"})
+    if budget > 0:
+        env["STRATA_RAM_THROUGH"] = "1"
+        if ram * GIB >= 28e9:
+            env["STRATA_PREFILL_AUTO_MAX"] = "16384"
+    room = "DF2" if df2 else "MTP"          # the server starts the engine with --serve and --draft dflash2 or --mtp
+    env.update({f"STRATA_{room}_ROOM_MIN": "4096", f"STRATA_{room}_ROOM_CHUNK": "1", f"STRATA_{room}_ROOM_HEAD": "1"})
+    return env
+
+
 def launcher(cfg_path, env):
+    if not WIN:
+        return launcher_sh(cfg_path, env)
     py = HOME / ".venv" / "Scripts" / "python.exe"
     lines = ["@echo off", "rem Written by FAST-SETUP.bat. Chat page and API: http://127.0.0.1:8080", "title SlenderEngine (32 GB tuned)"]
     lines += [f'set "{k}={v}"' for k, v in env.items()]
@@ -513,7 +589,7 @@ def first_run(a):
         if isinstance(got, str):
             sys.exit(got)
     elif a.yes:
-        sys.exit('--yes needs the model folder too, as in: FAST-SETUP.bat "D:\\Models\\IQ3_S" --yes')
+        sys.exit(f'--yes needs the model folder too, as in: {SETUP} "{"D:\\Models\\IQ3_S" if WIN else "/models/IQ3_S"}" --yes')
     else:
         got = ask_path("Where are the model files? Paste or drag their folder into this window, then press Enter:\n  > ",
                        find_model, False)
@@ -521,7 +597,7 @@ def first_run(a):
     say(f"  Model: {size} in {folder}")
     mmproj = find_mmproj(folder)
     say(f"  Pictures: on ({mmproj})" if mmproj else
-        f"  Pictures: off. To turn them on later, put {MMPROJ[0]} beside the model and run FAST-SETUP.bat --rebuild")
+        f"  Pictures: off. To turn them on later, put {MMPROJ[0]} beside the model and run {SETUP} --rebuild")
 
     drafter = None
     have = installed_drafter(config_path(a))
@@ -565,8 +641,12 @@ def run_setup(a, size, folder, mmproj, drafter_args, drafter):
            "--kv", "int8", "--vision", "gpu" if mmproj else "none", "--gguf-dir", str(folder),
            "--experimental-speed-projection", "off", "--yes", "--no-start"] + drafter_args
     say()
-    say(" Next, setup checks this PC, installs build tools that are missing (Visual Studio 2022 Build Tools, CUDA 13.0;")
-    say(" Windows may ask for permission), builds the engine, and writes a 50 GB experts file into the data folder it")
+    if WIN:
+        say(" Next, setup checks this PC, installs build tools that are missing (Visual Studio 2022 Build Tools, CUDA 13.0;")
+        say(" Windows may ask for permission), builds the engine, and writes a 50 GB experts file into the data folder it")
+    else:
+        say(" Next, setup checks this PC, installs build tools that are missing (build-essential and CUDA 13.0 through apt on")
+        say(" Ubuntu and Debian; sudo asks for your password), builds the engine, and writes a 50 GB experts file into the data folder it")
     say(" names. This takes a while; keep the window open. Setup may say IQ3_S needs 62 GB of RAM: that is upstream")
     say(" Strata's figure. This fork runs it on 32 GB by reading experts from the SSD.")
     if a.dry_run:
@@ -575,13 +655,11 @@ def run_setup(a, size, folder, mmproj, drafter_args, drafter):
     say()
     rc = subprocess.call(cmd, cwd=str(HOME))
     if rc != 0 or config_path(a) is None:
-        sys.exit("\nSetup did not finish, so nothing was tuned. See the messages above, then run FAST-SETUP.bat again.")
+        sys.exit(f"\nSetup did not finish, so nothing was tuned. See the messages above, then run {SETUP} again.")
     return drafter
 
 
 def main():
-    if os.name != "nt":
-        sys.exit("This setup is for Windows. On Linux, use ./setup.sh and the settings in FORK.md.")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", nargs="?")
     ap.add_argument("--drafter-dir")
@@ -602,7 +680,7 @@ def main():
     if a.rebuild and not a.path:
         folder = model_folder_of(source) if source else None
         if folder is None:
-            sys.exit("Nothing to rebuild yet: run FAST-SETUP.bat with the model folder first.")
+            sys.exit(f"Nothing to rebuild yet: run {SETUP} with the model folder first.")
         a.path = str(folder)
     drafter = None
     if a.path or source is None or not source.exists():
@@ -617,9 +695,9 @@ def main():
 
     exe = Path(cfg.get("exe") or "")
     if not exe.exists():
-        sys.exit(f"The engine {exe} is missing. Build it with: FAST-SETUP.bat --rebuild")
+        sys.exit(f"The engine {exe} is missing. Build it with: {SETUP} --rebuild")
     if PATCHED_MARK not in exe.read_bytes():
-        sys.exit(f"{exe} is a stock engine, or this fork's from before it applied its own defaults. Build this one with: FAST-SETUP.bat --rebuild")
+        sys.exit(f"{exe} is a stock engine, or this fork's from before it applied its own defaults. Build this one with: {SETUP} --rebuild")
 
     src = Path(args[args.index("--pack") + 1]) / "experts.bin"
     if not src.exists():
@@ -641,7 +719,7 @@ def main():
         say("The RTX 40 kernel table will not apply to this card: other cards may gain less.")
 
     skip = choose_skip(a)
-    vols = volumes()
+    vols = volumes() if WIN else []
     mirror = choose_mirror(a, src, vols)
 
     for k, v in (("--spec", "4"), ("--spec-min-p", "0.5"), ("--resident-budget-gib", f"{budget:g}"), ("--adapt-every", "4"), ("--adapt-swaps", "24"),
@@ -673,6 +751,8 @@ def main():
     df2_packs = sorted((data_dir / "dflash2").glob("*.pack"))
     if df2_packs:
         cfg["drafting"] = "dflash2"
+    if not WIN:
+        env = {**linux_fork_env(budget, ram, bool(df2_packs)), **env}
     out = Path(a.out_dir)
     cfg["args"] = args
     cfg["log"] = str(out / "strata-fast.log")
@@ -685,7 +765,10 @@ def main():
     for k, v in env.items():
         say(f"  {k}={v}")
     say(f"  Expert skip {skip}" + (" (none: every expert computed)" if skip == 0 else " (answers change)"))
-    say("  Plus the fork's defaults, which the engine applies by itself (FORK.md, \"Defaults\"; STRATA_FORK_DEFAULTS=0 turns them off)")
+    if WIN:
+        say("  Plus the fork's defaults, which the engine applies by itself (FORK.md, \"Defaults\"; STRATA_FORK_DEFAULTS=0 turns them off)")
+    else:
+        say("  The fork's Windows defaults are set above for Linux too: they have not been measured on Linux")
     say(("  DFlash2 drafter" if df2_packs else "  MTP drafter, " + " ".join(args[args.index("--spec"):args.index("--spec") + 2])) +
         f", {budget:g} GiB of experts in RAM, conversations not saved in RAM")
     if a.dry_run:
@@ -694,8 +777,11 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     cfg_path = out / "strata-fast.json"
     cfg_path.write_text(json.dumps(cfg, indent=1, ensure_ascii=False), encoding="utf-8")
-    (out / "run-fast.bat").write_text(launcher(cfg_path, env), encoding="utf-8", newline="")
-    say(f"\nDone. Start it with {out / 'run-fast.bat'}")
+    run = out / ("run-fast.bat" if WIN else "run-fast.sh")
+    run.write_text(launcher(cfg_path, env), encoding="utf-8", newline="")
+    if not WIN:
+        run.chmod(0o755)
+    say(f"\nDone. Start it with {run}")
     say("Close your browser and other large programs first: this uses most of a 32 GB PC.")
     return 0
 

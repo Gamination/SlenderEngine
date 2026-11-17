@@ -23,7 +23,7 @@ Since 2026-11-07 the engine applies the fork's own settings by itself, so a plai
 | The same, with `--serve` and `--draft dflash2` | `STRATA_DF2_ROOM_MIN=4096`, `STRATA_DF2_ROOM_CHUNK=1`, `STRATA_DF2_ROOM_HEAD=1` | A prompt of 4,096+ new tokens borrows the drafter's weights and the output head for its buffers and reads in larger chunks: 50K +10-11%, 29K +14%. First-token KL 0.0003-0.0022. See [the prompt room page](docs/fork/PROMPT-ROOM.md) |
 | The same, with `--serve` and `--mtp` (no `--batch`) | `STRATA_MTP_ROOM_MIN=4096`, `STRATA_MTP_ROOM_CHUNK=1`, `STRATA_MTP_ROOM_HEAD=1` | The same with the MTP drafter's experts: 50K +10-19.5%. A room that can't apply is left out with a note |
 
-Per-PC settings stay in `FAST-SETUP.bat`: the RAM tier and headroom, worker and reader cores, and the second SSD. Linux, AMD and GGUF files get only the first row.
+Per-PC settings stay in `FAST-SETUP.bat`: the RAM tier and headroom, worker and reader cores, and the second SSD. Linux, AMD and GGUF files get only the first row from the engine; on Linux, `fast-setup.sh` writes the rest of the table into its launcher (not measured on Linux; no second SSD there).
 
 `FAST-SETUP.bat` asks whether to skip experts. No (the default) keeps skip 0. Yes writes `STRATA_ROUTE_TAIL_SKIP=7` to its launcher: about 22% faster on the PC under Result, but answers change (KL 0.081). `--skip N` answers without asking.
 

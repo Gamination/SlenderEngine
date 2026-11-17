@@ -9,6 +9,7 @@ cd "$(dirname "$0")" || exit 1
 if [ -x python/bin/python3 ]; then
   PYTHONNOUSERSITE=1; export PYTHONNOUSERSITE
   unset PYTHONHOME PYTHONPATH
+  [ "${1:-}" = "--python-only" ] && exit 0
   exec python/bin/python3 setup.py "$@"
 fi
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate
@@ -73,4 +74,6 @@ if [ ! -x .venv/bin/python ]; then
     $PY -m venv .venv || { rm -rf .venv; echo "could not create .venv: sudo apt install python3-venv"; exit 1; }
   fi
 fi
+# --python-only (fast-setup.sh): Python and .venv are ready; stop before setup
+[ "${1:-}" = "--python-only" ] && exit 0
 exec .venv/bin/python setup.py "$@"

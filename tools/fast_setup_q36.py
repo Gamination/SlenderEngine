@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """One-step setup of Qwen3.6-35B-A3B UD-Q4_K_M (setup's --family qwen36) with the switches this fork measured, for this
-PC's card, RAM and CPU. FAST-SETUP-35B.bat runs it.
+PC's card, RAM and CPU. FAST-SETUP-35B.bat (Windows) and fast-setup-35b.sh (Linux) run it.
 
 The first run asks where the model file is (it is never downloaded here; a copy in the Hugging Face cache is used without
 asking), builds the engine with setup.py, then tunes. Later runs only tune.
@@ -11,7 +11,7 @@ asking), builds the engine with setup.py, then tunes. Later runs only tune.
   --yes              no questions (needs PATH, or the file in the Hugging Face cache)
 
 It reads the config setup wrote (strata-qwen36-ud-q4_k_m.json by default) and writes its own config and launcher beside it
-(strata-qwen36-fast.json, run-qwen36-fast.bat). Setup's files are not changed. Nothing is written with --dry-run.
+(strata-qwen36-fast.json, run-qwen36-fast.bat or run-qwen36-fast.sh on Linux). Setup's files are not changed. Nothing is written with --dry-run.
 
 What it sets (docs/fork/QWEN36-12GB.md has each switch and what was measured; measured on an RTX 4070 Ti 12 GB with 32 GB
 of DDR5, other PCs are estimates):
@@ -30,6 +30,7 @@ import argparse
 import ctypes
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -38,7 +39,9 @@ HOME = Path(__file__).resolve().parent.parent
 GIB = 1024 ** 3
 EXPERTS_GIB = 18.7       # UD-Q4_K_M with its MTP block: the experts' mapped blob file (measured 18.68 GiB)
 ENGINE_OWN_GIB = 4.3     # the engine's own host memory at 262K, 50K into a conversation (measured, RTX 4070 Ti)
-OS_APPS_GIB = 5.0        # Windows and a few desktop apps (estimate)
+OS_APPS_GIB = 5.0        # the system and a few desktop apps (estimate)
+WIN = os.name == "nt"
+SETUP = "FAST-SETUP-35B.bat" if WIN else "./fast-setup-35b.sh"   # what the messages tell the person to run
 
 # arm T (state/STATE-q36.md, docs/fork/QWEN36-12GB.md): name -> value, grouped as in run-q36.bat
 REFERENCE = {
@@ -70,6 +73,12 @@ def say(text=""):
 
 
 def total_ram_gib():
+    if not WIN:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024 / GIB
+        return 0.0
     class Status(ctypes.Structure):
         _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
                     ("page", ctypes.c_ulonglong), ("avail_page", ctypes.c_ulonglong), ("virt", ctypes.c_ulonglong),
@@ -81,7 +90,9 @@ def total_ram_gib():
 
 
 def cpu_layout():
-    """(P-cores, E-cores, logical processors of the P-cores) from Windows' processor information."""
+    """(P-cores, E-cores, logical processors of the P-cores) from the system's processor information."""
+    if not WIN:
+        return cpu_layout_linux()
     k = ctypes.windll.kernel32
     size = ctypes.c_ulong(0)
     k.GetLogicalProcessorInformationEx(0, None, ctypes.byref(size))
@@ -108,6 +119,41 @@ def cpu_layout():
     return len(pc), len(ec), sum(n for _, n in pc)
 
 
+def cpu_layout_linux(sysfs="/sys"):
+    """The same from sysfs: a hybrid Intel CPU lists its P-cores' logical CPUs in /sys/devices/cpu_core/cpus."""
+    def ids(text):
+        out = []
+        for part in (text or "").strip().split(","):
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                out += range(int(lo), int(hi) + 1)
+            elif part.strip():
+                out.append(int(part))
+        return out
+
+    def read(path):
+        try:
+            return Path(path).read_text()
+        except OSError:
+            return ""
+    pset = set(ids(read(f"{sysfs}/devices/cpu_core/cpus")))
+    root = Path(sysfs) / "devices" / "system" / "cpu"
+    seen, cores = set(), []
+    for n in sorted(int(d.name[3:]) for d in root.glob("cpu[0-9]*") if d.name[3:].isdigit()):
+        if n in seen:
+            continue
+        sib = ids(read(root / f"cpu{n}" / "topology" / "thread_siblings_list")) or [n]
+        seen.update(sib)
+        cores.append((n in pset, len(sib)))
+    if not cores:
+        n = os.cpu_count() or 4
+        return n, 0, n
+    if not pset:   # not a hybrid CPU: every core counts as a P-core
+        return len(cores), 0, sum(t for _, t in cores)
+    pc = [t for is_p, t in cores if is_p]
+    return len(pc), len(cores) - len(pc), sum(pc)
+
+
 def gpu_info():
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,compute_cap", "--format=csv,noheader,nounits"],
@@ -119,7 +165,15 @@ def gpu_info():
 
 
 def has_igpu():
-    """True when Windows lists a display adapter besides the NVIDIA one (an iGPU can drive the monitor)."""
+    """True when the system lists a display adapter besides the NVIDIA one (an iGPU can drive the monitor)."""
+    if not WIN:   # each DRM card's PCI vendor: 0x10de is NVIDIA
+        vendors = []
+        for v in Path("/sys/class/drm").glob("card[0-9]*/device/vendor"):
+            try:
+                vendors.append(v.read_text().strip().lower())
+            except OSError:
+                pass
+        return any(x != "0x10de" for x in vendors)
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"],
                              capture_output=True, text=True, timeout=20).stdout
@@ -150,12 +204,12 @@ def plan(gpu, vram, cc, ram, p, e, p_threads, igpu, context=None):
     need = EXPERTS_GIB + ENGINE_OWN_GIB + OS_APPS_GIB
     if ram < need:
         warnings.append(f"{ram:.0f} GB of RAM: the experts' mapped file ({EXPERTS_GIB} GiB) plus the engine ({ENGINE_OWN_GIB}) "
-                        f"and Windows with a few apps ({OS_APPS_GIB}) need about {need:.0f}. It will page and run far slower "
+                        f"and the system with a few apps ({OS_APPS_GIB}) need about {need:.0f}. It will page and run far slower "
                         "(estimate: a few tokens a second). This fork has no tuned setup for it yet: a fixed RAM budget with "
                         "SSD reads (V-TIER) is the planned fix.")
     elif ram < need + 4:
         warnings.append(f"{ram:.0f} GB of RAM is just enough: close large programs (browsers with many tabs, games, editors "
-                        "above ~4 GB) while it runs, or Windows pages")
+                        "above ~4 GB) while it runs, or the system pages")
     if vram < 6:
         warnings.append(f"{vram:.0f} GB of VRAM: the dense layers (~2 GiB) leave few expert slots; decode will be bound by the "
                         "CPU and RAM (estimate)")
@@ -173,7 +227,18 @@ def set_arg(args, name, value):
         args += [name, value]
 
 
+def launcher_sh(cfg_path, env, title):
+    q = lambda x: shlex.quote(str(x))   # noqa: E731
+    lines = ["#!/bin/sh", f"# {title}: written by tools/fast_setup_q36.py (fast-setup-35b.sh). Run it again to rewrite.",
+             'cd "$(dirname "$0")" || exit 1']
+    lines += [f"export {k}={q(v)}" for k, v in env.items()]
+    lines += ["export PYTHONUTF8=1", f'exec .venv/bin/python serve/server.py --engine strata --config {q(cfg_path)} "$@"']
+    return "\n".join(lines) + "\n"
+
+
 def launcher(cfg_path, env, title):
+    if not WIN:
+        return launcher_sh(cfg_path, env, title)
     lines = ["@echo off", f"rem {title}: written by tools\\fast_setup_q36.py (FAST-SETUP-35B.bat). Run it again to rewrite.",
              f"title {title}", 'cd /d "%~dp0"']
     lines += [f'set "{k}={v}"' for k, v in env.items()]
@@ -252,7 +317,7 @@ def first_run(a):
     elif (got := model_in_hf_cache()) is not None:
         say(f"  Found in the Hugging Face cache; used where it is.")
     elif a.yes:
-        sys.exit(f'--yes needs the model file too, as in: FAST-SETUP-35B.bat "D:\\Models\\{MODEL_NAME}" --yes')
+        sys.exit(f'--yes needs the model file too, as in: {SETUP} "{"D:\\Models" if WIN else "/models"}{chr(92) if WIN else "/"}{MODEL_NAME}" --yes')
     else:
         while True:
             try:
@@ -270,12 +335,17 @@ def first_run(a):
     pictures = (folder / MMPROJ).is_file()
     say(f"  Model: {got}")
     say(f"  Pictures: on ({folder / MMPROJ})" if pictures else
-        f"  Pictures: off. To turn them on later, put {MMPROJ} beside the model and run FAST-SETUP-35B.bat --rebuild")
+        f"  Pictures: off. To turn them on later, put {MMPROJ} beside the model and run {SETUP} --rebuild")
     cmd = [sys.executable, str(HOME / "setup.py"), "--family", "qwen36", "--model", "UD-Q4_K_M", "--build", "--context", "262144",
            "--gguf-dir", str(folder), "--vision", "yes" if pictures else "no", "--yes", "--no-start"]
     say()
-    say(" Next, setup checks this PC, installs build tools that are missing (Visual Studio 2022 Build Tools, CUDA 13.0;")
-    say(" Windows may ask for permission) and builds the engine for your card. Keep the window open. On its first start the")
+    if WIN:
+        say(" Next, setup checks this PC, installs build tools that are missing (Visual Studio 2022 Build Tools, CUDA 13.0;")
+        say(" Windows may ask for permission) and builds the engine for your card.")
+    else:
+        say(" Next, setup checks this PC, installs build tools that are missing (build-essential and CUDA 13.0 through apt")
+        say(" on Ubuntu and Debian; sudo asks for your password) and builds the engine for your card.")
+    say(" Keep the window open. On its first start the")
     say(" engine writes a 20 GB expert cache file next to the model, so that drive needs the room.")
     if a.dry_run:
         say("\nDry run: nothing was built. Setup would run as\n  " + subprocess.list2cmdline(cmd))
@@ -283,7 +353,7 @@ def first_run(a):
     say()
     rc = subprocess.call(cmd, cwd=str(HOME))
     if rc != 0 or not Path(a.config).is_file():
-        sys.exit("\nSetup did not finish, so nothing was tuned. See the messages above, then run FAST-SETUP-35B.bat again.")
+        sys.exit(f"\nSetup did not finish, so nothing was tuned. See the messages above, then run {SETUP} again.")
     return True
 
 
@@ -301,7 +371,7 @@ def main():
     if a.rebuild and not a.path:
         f = model_file_of(a.config)
         if f is None:
-            sys.exit("Nothing to rebuild yet: run FAST-SETUP-35B.bat with the model file first.")
+            sys.exit(f"Nothing to rebuild yet: run {SETUP} with the model file first.")
         a.path = str(f)
     if not a.simulate and (a.path or not Path(a.config).is_file()):
         if not first_run(a):
@@ -334,7 +404,7 @@ def main():
         return 0
     cfg_in = Path(a.config)
     if not cfg_in.is_file():
-        say(f"  Setup's config is not there: {cfg_in}. Run setup first (FAST-SETUP-35B.bat does).")
+        say(f"  Setup's config is not there: {cfg_in}. Run setup first ({SETUP} does).")
         return 1
     cfg = json.loads(cfg_in.read_text(encoding="utf-8"))
     cargs = list(cfg.get("args", []))
@@ -345,8 +415,10 @@ def main():
     cfg_path = out / "strata-qwen36-fast.json"
     cfg["log"] = str(out / "strata-qwen36-fast.log")
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-    bat = out / "run-qwen36-fast.bat"
+    bat = out / ("run-qwen36-fast.bat" if WIN else "run-qwen36-fast.sh")
     bat.write_text(launcher(cfg_path, env, "Qwen3.6-35B-A3B (tuned)"), encoding="ascii")
+    if not WIN:
+        bat.chmod(0o755)
     say(f"  Wrote {cfg_path.name} and {bat.name}. Start it with {bat.name}; setup's own launcher is unchanged.")
     return 0
 
