@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""One-step setup of Qwen3.8-Flash-Next GSQ-RCO IQ3_S on a 32 GB PC with an NVIDIA card. FAST-SETUP.bat (Windows) and
+"""One-step setup of Qwen3.8-Flash-Next (GSQ-RCO IQ3_S, the size this was measured on, or any other size setup.py runs) on a
+32 GB PC with an NVIDIA card. FAST-SETUP.bat (Windows) and
 fast-setup.sh (Linux) run this.
 
 The first run asks where the model files are (they are never downloaded here), builds the engine with setup.py, then tunes
@@ -7,7 +8,7 @@ for a 32 GB PC and offers dual SSD streaming (Windows only). Later runs only tun
 run-fast.bat (run-fast.sh on Linux) beside
 setup's own config; the tuning does not change setup's files. Nothing is written with --dry-run.
 
-  PATH                the model files: the folder with the two .gguf files, or one of them (dragging the folder onto
+  PATH                the model files: the folder with the .gguf files, or one of them (dragging the folder onto
                       FAST-SETUP.bat passes it here). Given again later, it sets the model up again from that folder
   --drafter-dir PATH  the DFlash2 drafter you have (config.json + model.safetensors, or its .pack). Without it the
                       first run asks; Enter downloads the MTP draft layer (about 5 GB) instead
@@ -45,17 +46,11 @@ WIN = os.name == "nt"
 SETUP = "FAST-SETUP.bat" if WIN else "./fast-setup.sh"      # what the messages tell the person to run
 PATCHED_MARK = b"STRATA_FORK_DEFAULTS"   # only this fork's engine holds this name, from the build that applies its defaults itself
 
-# The model files this setup tunes (ISTA-DASLab's GSQ-RCO quants), with the sizes setup.py pins (ISTA_FILES), so a download
-# that did not finish is caught here, before a build. IQ3_S is the one measured; IQ3_XXS is the smaller one the tuning also reads.
+# The model files: any Flash-Next set setup.py knows (ISTA-DASLab's GSQ-RCO sizes, Unsloth's, Gyro, Swift, the Coder), found by
+# name and checked against the sizes setup.py pins, so a download that did not finish is caught before a build. The tuning
+# below was measured on IQ3_S only.
 MODEL_PAGE = "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_S"
-MODEL_RE = re.compile(r"^Qwen3\.8-Flash-Next-GSQ-RCO-(IQ3_S|IQ3_XXS)-(\d{5})-of-(\d{5})\.gguf$", re.I)
-MODEL_SIZES = {
-    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf": 54817524224,
-    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf": 28800138432,
-    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf": 47039860096,
-    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf": 28800138432,
-}
-MMPROJ = ("mmproj-Qwen3.8-Flash-Next-BF16.gguf", 907543008)      # the picture encoder, in the same repository's top folder
+SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.I)
 DRAFTER_PAGE = "https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2"
 
 
@@ -426,48 +421,119 @@ def clean_path(text):
     return Path(text).expanduser() if text else None
 
 
+_SETUP = None
+
+
+def setup_tables():
+    """setup.py as a module (its install only runs as a script): the families, the models, the file names and pinned sizes."""
+    global _SETUP
+    if _SETUP is None:
+        import importlib.util
+        if str(HOME) not in sys.path:
+            sys.path.insert(0, str(HOME))
+        spec = importlib.util.spec_from_file_location("strata_setup_tables", HOME / "setup.py")
+        _SETUP = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_SETUP)
+    return _SETUP
+
+
+def pinned_sizes(name, fam):
+    """The sizes setup.py pins for a file of this family (a set: Unsloth's UD-Q4_K_XL has two layouts)."""
+    S = setup_tables()
+    sizes = set()
+    if name in (fam.get("sha256") or {}):
+        sizes.add(fam["sha256"][name][0])
+    for pin in (fam.get("sha256_alt") or {}).get(name, ()):
+        sizes.add(pin[0])
+    if name in S.ISTA_FILES:
+        sizes.add(S.ISTA_FILES[name][0])
+    return sizes
+
+
+def identify(f):
+    """(family, model) for a model file (any shard of the set), or None."""
+    S = setup_tables()
+    first = SHARD_RE.sub(lambda m: f"-00001-of-{m.group(2)}.gguf", f.name) if SHARD_RE.search(f.name) else f.name
+    return S.gguf_choice(first)
+
+
+def unsupported_why(files):
+    """Plain words for model files setup cannot run (setup.py's own reasons), or for files it does not know at all."""
+    S = setup_tables()
+    if any(f.name.startswith("Qwen3.6-") for f in files):
+        return f"That is Qwen3.6, not Qwen3.8-Flash-Next: set it up with {'FAST-SETUP-35B.bat' if WIN else './fast-setup-35b.sh'}."
+    if not any("Flash-Next" in f.name for f in files):
+        return "These are not Qwen3.8-Flash-Next files. " + S.SUPPORTED_GGUFS
+    for f in files:
+        q = S.gguf_unsupported(f.name)
+        if q:
+            return f"{f.name} is {q}, which this engine can't run. " + S.UNSUPPORTED_WHY.get(q.upper(), S.SUPPORTED_GGUFS)
+    return "These are not files setup knows. " + S.SUPPORTED_GGUFS
+
+
+def nice_size(n):
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.1f} MB"
+
+
 def find_model(path):
-    """(folder, size name, shard paths) for the model files at `path`: one of the files, the folder with them, or the folder
-    above it (the repository's own layout, IQ3_S\\ inside). Else a plain-words reason they cannot be used."""
+    """(folder, family, size name, shard paths) for the model files at `path`: one of the files, the folder with them, or the
+    folder above it (a repository's own layout, one folder per size). Else a plain-words reason they cannot be used."""
+    S = setup_tables()
     if path is None or not path.exists():
         return f"{path} was not found."
+    ggufs = lambda d: sorted(g for g in d.glob("*.gguf") if not g.name.lower().startswith("mmproj"))  # noqa: E731
     if path.is_file():
-        if not MODEL_RE.match(path.name):
-            return (f"{path.name} is not one of the model files. They are named like "
-                    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf.")
-        firsts = [path.with_name(re.sub(r"-\d{5}-of-", "-00001-of-", path.name, count=1))]
+        files = [path]
     else:
-        firsts = []
-        for folder in (path, path / "IQ3_S", path / "IQ3_XXS"):
-            try:
-                firsts += sorted(f for f in folder.glob("*-00001-of-*.gguf") if MODEL_RE.match(f.name))
-            except OSError:
-                pass
-        if not firsts:
-            return (f"No model files in {path}. It needs the two Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000N-of-00002.gguf "
-                    f"files from {MODEL_PAGE}")
-        firsts.sort(key=lambda f: MODEL_RE.match(f.name).group(1).upper() != "IQ3_S")      # IQ3_S first when both are there
-    first = firsts[0]
-    m = MODEL_RE.match(first.name)
-    size, total = m.group(1).upper(), int(m.group(3))
-    shards = [first.with_name(re.sub(r"-00001-of-", "-%05d-of-" % i, first.name, count=1)) for i in range(1, total + 1)]
+        files = ggufs(path)
+        if not files:      # the folder above the sizes' folders: take it only when it holds one size
+            sets = {}
+            for d in sorted(x for x in path.iterdir() if x.is_dir()):
+                for g in ggufs(d):
+                    c = identify(g)
+                    if c:
+                        sets.setdefault(c, d)
+            if len(sets) > 1:
+                return (f"{path} holds several sizes ({', '.join(m for _f, m in sets)}). Point to the folder of the one you want.")
+            files = ggufs(next(iter(sets.values()))) if sets else []
+        if not files:
+            return f"No model files in {path}. The recommended size is IQ3_S, the two files from {MODEL_PAGE}"
+    found = {}
+    for f in files:
+        c = identify(f)
+        if c:
+            found.setdefault(c, f)
+    if not found:
+        return unsupported_why(files)
+    if len(found) > 1:     # several sizes in one folder: IQ3_S first, else ask for one
+        if ("qwen", "IQ3_S") not in found:
+            return f"{path} holds several sizes ({', '.join(m for _f, m in found)}). Point to one of their files."
+        found = {("qwen", "IQ3_S"): found[("qwen", "IQ3_S")]}
+    (family, model), f = next(iter(found.items()))
+    fam = S.FAMILIES[family]
+    shards = [f.with_name(S.model_file(fam, model, i)) for i in range(1, S.model_shards(fam, model) + 1)]
     for sh in shards:
         if not sh.is_file():
-            return f"{sh.name} is missing from {first.parent}. Both files are needed."
-        want, have = MODEL_SIZES.get(sh.name), sh.stat().st_size
-        if want and have != want:
-            return (f"{sh.name} is {have / 1e9:.1f} GB, but the published file is {want / 1e9:.1f} GB: the download did not "
+            return f"{sh.name} is missing from {f.parent}. All {len(shards)} files of {model} are needed."
+        want, have = pinned_sizes(sh.name, fam), sh.stat().st_size
+        if want and have not in want:
+            return (f"{sh.name} is {nice_size(have)}, but the published file is {nice_size(max(want))}: the download did not "
                     "finish, or the file was changed. Download it again, then run this again.")
-    return first.parent, size, shards
+    return f.parent, family, model, shards
 
 
-def find_mmproj(folder):
-    """The picture encoder beside the model files, or in the folder above them (where the repository keeps it), or None.
-    Outside the model's own folder only a file of the full size counts (a half-copied one is not used)."""
-    name, size = MMPROJ
+def find_mmproj(folder, family):
+    """The family's picture encoder beside the model files, or in the folder above them (where the repositories keep it), or
+    None. Outside the model's own folder only a file of the pinned size counts (a half-copied one is not used)."""
+    S = setup_tables()
+    fam = S.FAMILIES[family]
+    name = fam.get("mmproj")
+    if not name:
+        return None
+    sizes = pinned_sizes(name, fam) | ({fam["mmproj_sha256"][0]} if fam.get("mmproj_sha256") else set())
     for f in (folder / name, folder.parent / name, folder.parent / "models" / name):
         try:
-            if f.is_file() and (f.parent == folder or f.stat().st_size == size):
+            if f.is_file() and (f.parent == folder or not sizes or f.stat().st_size in sizes):
                 return f
         except OSError:
             continue
@@ -560,28 +626,41 @@ def install_drafter(drafter, data_dir):
     say("  DFlash2 drafter ready.")
 
 
+REMEMBER = HOME / "fast-setup.json"       # which of setup's configs the fast setup tunes (a later run without a path)
+
+
 def config_path(a):
-    return Path(a.config) if a.config else next((p for p in (HOME / "strata-iq3_s.json", HOME / "strata-iq3_xxs.json") if p.exists()), None)
+    if a.config:
+        return Path(a.config)
+    try:
+        p = Path(json.loads(REMEMBER.read_text(encoding="utf-8"))["config"])
+        if p.exists():
+            return p
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return next((p for p in (HOME / "strata-iq3_s.json", HOME / "strata-iq3_xxs.json") if p.exists()), None)
 
 
 def model_folder_of(cfg_file):
-    """The model folder setup used before (the --native shard in its config), or None."""
+    """The model folder setup used before (the first model .gguf its config names), or None."""
     try:
         args = json.loads(Path(cfg_file).read_text(encoding="utf-8")).get("args") or []
-        return Path(args[args.index("--native") + 1]).parent
-    except (OSError, ValueError, IndexError, TypeError):
+    except (OSError, ValueError, TypeError):
         return None
+    f = next((x for x in args if isinstance(x, str) and x.lower().endswith(".gguf") and not Path(x).name.lower().startswith("mmproj")), None)
+    return Path(f).parent if f else None
 
 
 def first_run(a):
     """Ask for the model (and the drafter), then build with setup.py. Returns the drafter to install after the build, or
     "dry" on a dry run."""
     say()
-    say(" SlenderEngine setup: Qwen3.8-Flash-Next GSQ-RCO IQ3_S")
+    say(" SlenderEngine setup: Qwen3.8-Flash-Next")
     say()
-    say(" You need the model's two .gguf files (84 GB), downloaded yourself from")
+    say(" You need the model's .gguf files, downloaded yourself. Recommended (measured here): IQ3_S, two files, 84 GB, from")
     say(f"   {MODEL_PAGE}")
-    say(f" Optional, beside them or in the folder above: {MMPROJ[0]} (0.9 GB, for pictures).")
+    say(" Other sizes setup runs work too (ISTA-DASLab's GSQ-RCO, Unsloth's, Gyro); only IQ3_S was measured.")
+    say(" Optional, beside them or in the folder above: mmproj-Qwen3.8-Flash-Next-BF16.gguf (0.9 GB, for pictures).")
     say(f" Optional: the DFlash2 drafter (1.2 GB) from {DRAFTER_PAGE}")
     say()
     if a.path:
@@ -593,18 +672,27 @@ def first_run(a):
     else:
         got = ask_path("Where are the model files? Paste or drag their folder into this window, then press Enter:\n  > ",
                        find_model, False)
-    folder, size, _shards = got
-    say(f"  Model: {size} in {folder}")
-    mmproj = find_mmproj(folder)
+    folder, family, size, _shards = got
+    S = setup_tables()
+    fam = S.FAMILIES[family]
+    say(f"  Model: {fam['title']} {size} in {folder}")
+    if size != "IQ3_S":
+        say("  Only IQ3_S was measured with this fork's settings; this size gets the same settings, not measured.")
+    a.config = str(HOME / f"strata-{(fam['tag'] + size).lower()}.json")
+    mmproj = find_mmproj(folder, family)
     say(f"  Pictures: on ({mmproj})" if mmproj else
-        f"  Pictures: off. To turn them on later, put {MMPROJ[0]} beside the model and run {SETUP} --rebuild")
+        f"  Pictures: off. To turn them on later, put {fam.get('mmproj', 'the picture encoder')} beside the model and run {SETUP} --rebuild")
 
     drafter = None
     have = installed_drafter(config_path(a))
     if have and not a.drafter_dir:
         say(f"  Drafter: {have}, already set up")
         cmd_drafter = ["--drafter", "dflash2"] if have == "DFlash2" else []
-        return run_setup(a, size, folder, mmproj, cmd_drafter, None)
+        return run_setup(a, family, size, folder, mmproj, cmd_drafter, None)
+    drafting, _ = drafting_modules()
+    if family not in drafting.SUPPORTED_FAMILIES:
+        say("  Drafter: the MTP draft layer, downloaded during setup (about 5 GB); DFlash2 is not made for this family")
+        return run_setup(a, family, size, folder, mmproj, [], None)
     if a.drafter_dir:
         drafter = find_drafter(clean_path(a.drafter_dir))
         if isinstance(drafter, str):
@@ -617,7 +705,7 @@ def first_run(a):
         drafter = ask_path("Where is the DFlash2 drafter? Paste its folder, or press Enter to download the MTP draft layer "
                            "(about 5 GB) instead:\n  > ", find_drafter, True)
     say(f"  Drafter: DFlash2 ({drafter[1]})" if drafter else "  Drafter: the MTP draft layer, downloaded during setup (about 5 GB)")
-    return run_setup(a, size, folder, mmproj, ["--drafter", "dflash2"] if drafter else [], drafter)
+    return run_setup(a, family, size, folder, mmproj, ["--drafter", "dflash2"] if drafter else [], drafter)
 
 
 def installed_drafter(cfg_file):
@@ -636,19 +724,19 @@ def installed_drafter(cfg_file):
     return "MTP" if (data_dir / "mtp" / "rt" / "experts.bin").is_file() else None
 
 
-def run_setup(a, size, folder, mmproj, drafter_args, drafter):
-    cmd = [sys.executable, str(HOME / "setup.py"), "--family", "qwen", "--model", size, "--build", "--context", "262144",
+def run_setup(a, family, size, folder, mmproj, drafter_args, drafter):
+    cmd = [sys.executable, str(HOME / "setup.py"), "--family", family, "--model", size, "--build", "--context", "262144",
            "--kv", "int8", "--vision", "gpu" if mmproj else "none", "--gguf-dir", str(folder),
            "--experimental-speed-projection", "off", "--yes", "--no-start"] + drafter_args
     say()
     if WIN:
         say(" Next, setup checks this PC, installs build tools that are missing (Visual Studio 2022 Build Tools, CUDA 13.0;")
-        say(" Windows may ask for permission), builds the engine, and writes a 50 GB experts file into the data folder it")
+        say(" Windows may ask for permission), builds the engine and prepares the model in the data folder it names (for")
     else:
         say(" Next, setup checks this PC, installs build tools that are missing (build-essential and CUDA 13.0 through apt on")
-        say(" Ubuntu and Debian; sudo asks for your password), builds the engine, and writes a 50 GB experts file into the data folder it")
-    say(" names. This takes a while; keep the window open. Setup may say IQ3_S needs 62 GB of RAM: that is upstream")
-    say(" Strata's figure. This fork runs it on 32 GB by reading experts from the SSD.")
+        say(" Ubuntu and Debian; sudo asks for your password), builds the engine and prepares the model in the data folder it names (for")
+    say(" IQ3_S, a 50 GB experts file). This takes a while; keep the window open. Setup may say the model needs more RAM")
+    say(" than this PC has: that is upstream Strata's figure for every expert in RAM. This fork reads the rest from the SSD.")
     if a.dry_run:
         say("\nDry run: nothing was built. Setup would run as\n  " + subprocess.list2cmdline(cmd))
         return "dry"
@@ -691,7 +779,7 @@ def main():
     cfg = json.loads(source.read_text(encoding="utf-8"))
     args = cfg.get("args") or []
     if "--pack" not in args:
-        sys.exit(f"{source} has no --pack: this setup is for the IQ packs of Qwen3.8-Flash-Next.")
+        sys.exit(f"{source} has no --pack: this setup is for Qwen3.8-Flash-Next set up by setup.py.")
 
     exe = Path(cfg.get("exe") or "")
     if not exe.exists():
@@ -700,8 +788,6 @@ def main():
         sys.exit(f"{exe} is a stock engine, or this fork's from before it applied its own defaults. Build this one with: {SETUP} --rebuild")
 
     src = Path(args[args.index("--pack") + 1]) / "experts.bin"
-    if not src.exists():
-        sys.exit(f"{src} is missing. The dual SSD option needs a pack with experts.bin.")
 
     ram = total_ram_gib()
     cores = cpu_cores()
@@ -720,7 +806,11 @@ def main():
 
     skip = choose_skip(a)
     vols = volumes() if WIN else []
-    mirror = choose_mirror(a, src, vols)
+    if src.exists():
+        mirror = choose_mirror(a, src, vols)
+    else:
+        mirror = None
+        say("Dual SSD: not for this size (its experts are read from the .gguf files, not from one experts.bin). One drive.")
 
     for k, v in (("--spec", "4"), ("--spec-min-p", "0.5"), ("--resident-budget-gib", f"{budget:g}"), ("--adapt-every", "4"), ("--adapt-swaps", "24"),
                  ("--adapt-async", "1"), ("--kv-resident", "32768"), ("--conversation-cache-mib", "0")):
@@ -777,6 +867,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     cfg_path = out / "strata-fast.json"
     cfg_path.write_text(json.dumps(cfg, indent=1, ensure_ascii=False), encoding="utf-8")
+    REMEMBER.write_text(json.dumps({"config": str(source)}), encoding="utf-8")
     run = out / ("run-fast.bat" if WIN else "run-fast.sh")
     run.write_text(launcher(cfg_path, env), encoding="utf-8", newline="")
     if not WIN:

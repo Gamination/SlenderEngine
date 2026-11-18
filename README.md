@@ -58,6 +58,8 @@ This guide builds the fork from source. For AMD, Mac or the upstream desktop app
 - **Pictures:** `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (0.9 GB) from the same repository's top folder, saved beside the two files or in the folder above them. Without it, images are off.
 - **The DFlash2 drafter:** `config.json` and `model.safetensors` (1.2 GB) from [incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2), in a folder of their own. It is the drafter the speeds above were measured with. Without it, setup downloads the MTP draft layer (5 GB) instead.
 
+**Another Flash-Next size** works the same way: point setup at that size's folder and it recognizes the files. That covers ISTA-DASLab's other GSQ-RCO sizes, [Unsloth's](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (UD-IQ1_M to Q8_0), Gyro, Swift and the Coder. Only IQ3_S was measured with this fork's settings. Unsloth's sizes read their experts straight from the `.gguf` files, so they write no 50 GB experts file and can't use a second SSD.
+
 **Qwen3.6-35B-A3B:** download `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (22.7 GB) from [unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF). It must be this repository's file, which has the MTP block; the one in Unsloth's repository without MTP is a different size and is refused. A copy already in your Hugging Face cache is used without asking. For pictures, put `mmproj-F16.gguf` (0.9 GB) from the same repository beside it.
 
 ### 2. Get this fork and run setup
@@ -149,7 +151,8 @@ The experts take about 18.7 GB of RAM as a mapped file. With a browser and a few
 | Linux: `Permission denied` on a `.sh` file | Run it with `sh`, as in `sh fast-setup.sh`, or make it executable with `chmod +x fast-setup.sh`. |
 | The fast setup is missing | That folder is upstream Strata, not this fork. Download this fork with the command in step 2. |
 | "… is X GB, but the published file is Y GB" | The model download did not finish, or the file was changed. Download that file again. |
-| "No model files in …" | Point setup to the folder that holds the two `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000N-of-00002.gguf` files, or to one of them. |
+| "No model files in …" or "holds several sizes" | Point setup to the folder of one size (for IQ3_S, the folder with the two `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000N-of-00002.gguf` files), or to one of its files. |
+| "… which this engine can't run" | That quant isn't supported (for example Unsloth's UD-IQ1_S). The message lists the sizes that are. |
 | Python could not be installed | Windows: install [64-bit Python 3.12](https://www.python.org/downloads/windows/), enable **Add python.exe to PATH**, and rerun setup. Linux: install Python 3.10 or newer with venv (Ubuntu/Debian: `sudo apt install python3-venv`). |
 | Build tools or CUDA could not be installed | See the manual installation steps below, then rerun setup. |
 | Tuning stops with "… is a stock engine, or this fork's from before it applied its own defaults" | The engine wasn't built from this fork's code. Run the fast setup with `--rebuild`. |
