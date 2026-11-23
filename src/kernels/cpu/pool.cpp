@@ -1195,9 +1195,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const auto& [p, n] = pf_chunks_[i];
                 {   // loads, not prefetch hints: a hint may be dropped when the miss buffers are full (hints measured -10%)
                     uint64_t acc = 0;
-                    for (size_t o = 0; o < n; o += 256)
-                        acc += *(const volatile uint8_t*) (p + o) + *(const volatile uint8_t*) (p + o + 64) +
-                               *(const volatile uint8_t*) (p + o + 128) + *(const volatile uint8_t*) (p + o + 192);
+                    for (size_t o = 0; o < n; o += 64) acc += *(const volatile uint8_t*) (p + o);   // one byte a line, never past n
                     pf_sink_.fetch_add(acc, std::memory_order_relaxed);
                 }
             }

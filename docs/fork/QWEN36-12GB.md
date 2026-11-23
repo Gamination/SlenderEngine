@@ -233,7 +233,8 @@ above and the fast setup)
   f16 host copy, 1 MiB a layer) on this layer's MoE input, and the pool reads the CPU-side bytes of the top 8 experts a
   row into its caches until the next layer's routing arrives; the routing and the arithmetic are untouched. RTX 4060
   Laptop 8 GB, `--mtp 1`, server decode (with `STRATA_Q36_ATT_Q8M=1` in both runs): 2K 47.0 → 56.9, 25K 43.6 → 49.3,
-  40K 41.4 → 45.6 tok/s. 6 to 12 measured the same, 16 slower.
+  40K 41.4 → 45.6 tok/s on a build that also splits the pool's work into 96 tasks; this switch alone on the release
+  build, raw decode (`--mtp 0`, short context): 44.3 → 47.8. 6 to 12 measured the same, 16 slower.
 - `STRATA_Q36_MTP_KVONLY=1`: the MTP block's pass over a prompt writes only its K/V cells (the same kernels), with no
   attention, experts or expert stream for prompt rows. A 50K read 4,318 → 4,527 tok/s, the same text.
 - Opt-in, not in the configuration: `STRATA_Q36_SLOT_FIX=1` (the slot budget no longer subtracts the prompt-chunk
